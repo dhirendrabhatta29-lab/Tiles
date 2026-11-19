@@ -363,6 +363,9 @@ class MainActivity : Activity() {
     }
     private var started = false
     private var resumed = false
+    private var pausedForExternal = false
+    private var backCallback: Any? = null
+    private var lastGridTapMs = 0L
     private lateinit var lockAnimation: LockTurnController
     private var needsEntrance = true
     private var folderEntrancePending = false
@@ -568,6 +571,13 @@ class MainActivity : Activity() {
             override fun onPackagesUnavailable(p: Array<out String>?, u: UserHandle?, r: Boolean) = post(p.orEmpty().toSet())
             private fun post(packages: Set<String>) = runOnUiThread { reload(packages) }
         })
+        if (Build.VERSION.SDK_INT >= 33) {
+            val cb = android.window.OnBackInvokedCallback { handleBackNavigation() }
+            backCallback = cb
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(
+                android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, cb
+            )
+        }
         if (!launcherPrefs.onboardingSeen) {
             root.post { if (!isDestroyed) openSettings(onboarding = true) }
         }
@@ -607,6 +617,8 @@ class MainActivity : Activity() {
         super.onResume()
         if (::lockAnimation.isInitialized) lockAnimation.onResumed()
         cancelLaunchMotion()
+        val returningFromExternal = pausedForExternal
+        pausedForExternal = false
         resumed = true
         refreshDynamicPalette()
         loadWeather()
@@ -617,6 +629,14 @@ class MainActivity : Activity() {
         refreshAlarmLabels()
         if (useWallpaper) applyHomeBackground()
         updateOverlayBlur()
+        if (returningFromExternal && ::launcherPrefs.isInitialized && launcherPrefs.recentsSmoothEnabled &&
+            launcherPrefs.launchStyle != LauncherPrefs.LAUNCH_TURN && !folderOpen && !drawerOpen &&
+            (!::settingsOverlay.isInitialized || !settingsOverlay.showing) && ValueAnimator.areAnimatorsEnabled()) {
+            needsEntrance = false
+            LaunchTransitionHelper.animateRecentsReturn(homeTiles, true, launcherPrefs.launchSpeedMs)
+        } else if (::homeTiles.isInitialized && homeTiles.scaleX != 1f) {
+            LaunchTransitionHelper.animateRecentsReturn(homeTiles, false, 0)
+        }
         root.invalidate()
         startLive()
     }
@@ -624,6 +644,7 @@ class MainActivity : Activity() {
     override fun onPause() {
         super.onPause()
         resumed = false
+        pausedForExternal = true
         handler.removeCallbacks(armFolderDrag)
         folderPan.stopPaging()
         touching = false
@@ -657,6 +678,12 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        if (Build.VERSION.SDK_INT >= 33) {
+            (backCallback as? android.window.OnBackInvokedCallback)?.let {
+                try { onBackInvokedDispatcher.unregisterOnBackInvokedCallback(it) } catch (_: Exception) { }
+            }
+            backCallback = null
+        }
         unregisterWallpaperObserver?.invoke()
         unregisterWallpaperObserver = null
         if (::lockAnimation.isInitialized) lockAnimation.dispose()
@@ -706,8 +733,7 @@ class MainActivity : Activity() {
         for (tile in tiles) if (tile.layerType != type) tile.setLayerType(type, null)
     }
 
-    @Deprecated("Deprecated in Java")
-    override fun onBackPressed() {
+    private fun handleBackNavigation() {
         if (launchAnimator != null) cancelLaunchMotion()
         else if (::settingsOverlay.isInitialized && settingsOverlay.showing) settingsOverlay.close()
         else if (menuView != null) closeMenu()
@@ -717,17 +743,27 @@ class MainActivity : Activity() {
         else if (editItem != null) { editItem = null; rebuildHome() }
     }
 
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        handleBackNavigation()
+    }
+
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
         cancelLaunchMotion()
         closeMenu()
-        if (::settingsOverlay.isInitialized && settingsOverlay.showing) settingsOverlay.close(immediate = true)
+        val wasSettings = ::settingsOverlay.isInitialized && settingsOverlay.showing
+        if (wasSettings) settingsOverlay.close(immediate = true)
         val wasDrawer = drawerOpen || drawer.visibility == View.VISIBLE
         if (wasDrawer) closeDrawer(immediate = true)
-        if (wasDrawer && started && intent?.hasCategory(Intent.CATEGORY_HOME) == true) needsEntrance = true
-        if (folderOpen && intent?.hasCategory(Intent.CATEGORY_HOME) == true) closeFolder()
-        // Home can receive another intent while already visible. Keep any entrance in progress.
-        if (homeAnimator == null) homeScroll.scrollTo(0, 0)
+        val isHomeIntent = intent?.hasCategory(Intent.CATEGORY_HOME) == true
+        if (wasDrawer && started && isHomeIntent) needsEntrance = true
+        if (folderOpen && isHomeIntent) closeFolder()
+        // Only smoothly return to top when explicitly tapping Home while already focused on Home,
+        // avoiding jarring scroll jumps when returning from system Recents / Overview.
+        if (homeAnimator == null && isHomeIntent && resumed && hasWindowFocus() && !wasDrawer && !wasSettings) {
+            homeScroll.smoothScrollTo(0, 0)
+        }
         root.invalidate()
     }
 
@@ -1006,7 +1042,26 @@ class MainActivity : Activity() {
         val dockBottomMargin = px(12f)
         grid = FrameLayout(this).apply {
             setOnLongClickListener { if (editItem == null) homeMenu(); true }
-            setOnClickListener { if (editItem != null) { editItem = null; rebuildHome() } }
+            setOnClickListener {
+                if (editItem != null) {
+                    editItem = null
+                    rebuildHome()
+                } else if (::launcherPrefs.isInitialized && launcherPrefs.doubleTapLockEnabled) {
+                    val now = android.os.SystemClock.uptimeMillis()
+                    if (now - lastGridTapMs in 1..320L) {
+                        lastGridTapMs = 0L
+                        if (!TilesAccessibilityService.lockScreen()) {
+                            Toast.makeText(
+                                this@MainActivity,
+                                "Enable Accessibility Service in Settings -> Permissions to double-tap lock",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    } else {
+                        lastGridTapMs = now
+                    }
+                }
+            }
         }
         enableTileDrop(grid, px(12f), px(10f), tile + gap) { item, column, row ->
             val index = items.indexOf(item)
@@ -2756,7 +2811,13 @@ class MainActivity : Activity() {
 
     private fun motionMenu() {
         val idleEnabled = prefs.getBoolean("idle_tile_motion", true)
-        val flip = flipOnLaunch()
+        val style = launcherPrefs.launchStyle
+        val styleLabel = when (style) {
+            LauncherPrefs.LAUNCH_MORPH -> "morph (spring)"
+            LauncherPrefs.LAUNCH_TURN -> "tile turn"
+            LauncherPrefs.LAUNCH_SLIDE -> "slide"
+            else -> "none"
+        }
         menu("motion", listOf(
             entry("preview return home") { previewHomeMotion() },
             entry("preview lock animation") { lockAnimation.preview() },
@@ -2767,8 +2828,13 @@ class MainActivity : Activity() {
             },
             entry("lock button height: ${lockButtonHeightPercent()}%") { lockButtonHeightDialog() },
             entry("return home duration: ${homeReturnDurationMs()} ms") { homeDurationDialog() },
-            entry(if (flip) "open app: tile turn" else "open app: slide") {
-                prefs.edit().putBoolean("flip_on_launch", !flip).apply()
+            entry("open app: $styleLabel") {
+                launcherPrefs.launchStyle = when (style) {
+                    LauncherPrefs.LAUNCH_MORPH -> LauncherPrefs.LAUNCH_TURN
+                    LauncherPrefs.LAUNCH_TURN -> LauncherPrefs.LAUNCH_SLIDE
+                    LauncherPrefs.LAUNCH_SLIDE -> LauncherPrefs.LAUNCH_NONE
+                    else -> LauncherPrefs.LAUNCH_MORPH
+                }
                 motionMenu()
             },
             entry(if (idleEnabled) "idle icon motion: on" else "idle icon motion: off") {
@@ -3991,22 +4057,25 @@ class MainActivity : Activity() {
         swipeFingerOnCanvas = false
     }
 
-    private fun flipOnLaunch() = prefs.getBoolean("flip_on_launch", true)
+    private fun flipOnLaunch() = ::launcherPrefs.isInitialized && launcherPrefs.launchStyle == LauncherPrefs.LAUNCH_TURN
 
-    private fun launch(host: TileHost, app: App) = runTileLaunch(host) { openMainApp(app) }
+    private fun launch(host: TileHost, app: App) = runTileLaunch(host) { openMainApp(app, host) }
 
-    private fun openMainApp(app: App) {
+    private fun openMainApp(app: App, sourceHost: View? = null) {
         closeMenu()
         hideKeyboard()
         try {
+            val options = appOpenAnimation(sourceHost)
+            val bounds = LaunchTransitionHelper.sourceBounds(sourceHost)
             if (app.user == Process.myUserHandle()) {
                 // LauncherApps.startMainActivity does not expose Intent flags. Use a normal
-                // launcher Intent for this profile so Android receives NO_ANIMATION itself.
+                // launcher Intent for this profile so Android receives NO_ANIMATION when needed.
                 val intent = Intent.makeMainActivity(app.component)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
-                startActivity(withLaunchFlags(intent), appOpenAnimation())
+                if (bounds != null) intent.sourceBounds = bounds
+                startActivity(withLaunchFlags(intent), options)
             } else {
-                la.startMainActivity(app.component, app.user, null, appOpenAnimation())
+                la.startMainActivity(app.component, app.user, bounds, options)
             }
             suppressLegacyAppTransition()
             if (drawerOpen) closeDrawer(immediate = true)
@@ -4019,7 +4088,15 @@ class MainActivity : Activity() {
 
     private fun runTileLaunch(host: TileHost, open: () -> Unit) {
         if (!resumed || !hasWindowFocus() || !host.isShown || launchAnimator != null) return
-        if (!flipOnLaunch()) {
+        val style = if (::launcherPrefs.isInitialized) launcherPrefs.launchStyle else LauncherPrefs.LAUNCH_MORPH
+        if (style == LauncherPrefs.LAUNCH_MORPH) {
+            if (ValueAnimator.areAnimatorsEnabled()) {
+                LaunchTransitionHelper.pulseMorphSource(host, launcherPrefs.launchSpeedMs)
+            }
+            open()
+            return
+        }
+        if (style != LauncherPrefs.LAUNCH_TURN) {
             open()
             return
         }
@@ -4029,7 +4106,8 @@ class MainActivity : Activity() {
         }
         clearHomeMotion()
         stopIconMotion()
-        val flights = prepareTurnstile(selected = host, durationMs = APP_LAUNCH_TURN_MS)
+        val turnMs = launcherPrefs.launchSpeedMs.coerceIn(220, 560)
+        val flights = prepareTurnstile(selected = host, durationMs = turnMs)
         if (flights.isEmpty()) {
             openDirectly(open)
             return
@@ -4093,12 +4171,17 @@ class MainActivity : Activity() {
             tile.rotationY = 0f
             tile.translationX = 0f
             tile.translationY = 0f
+            tile.scaleX = 1f
+            tile.scaleY = 1f
             tile.alpha = 1f
             center(tile)
         }
     }
 
-    private fun shouldSkipAppTransition() = directAppHandoff || flipOnLaunch()
+    private fun shouldSkipAppTransition(): Boolean {
+        val style = if (::launcherPrefs.isInitialized) launcherPrefs.launchStyle else LauncherPrefs.LAUNCH_MORPH
+        return directAppHandoff || style == LauncherPrefs.LAUNCH_TURN || style == LauncherPrefs.LAUNCH_NONE
+    }
 
     private fun withLaunchFlags(intent: Intent): Intent {
         if (shouldSkipAppTransition()) intent.addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION)
@@ -4112,14 +4195,14 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun appOpenAnimation(): Bundle = if (shouldSkipAppTransition()) {
-        ActivityOptions.makeCustomAnimation(this, 0, 0).toBundle()
-    } else {
-        ActivityOptions.makeCustomAnimation(this, R.anim.app_enter, R.anim.home_exit).toBundle()
+    private fun appOpenAnimation(source: View? = null): Bundle {
+        val style = if (::launcherPrefs.isInitialized) launcherPrefs.launchStyle else LauncherPrefs.LAUNCH_MORPH
+        return LaunchTransitionHelper.buildLaunchOptions(this, source, style, directAppHandoff)
     }
 
-    /** Swipe down on home: open the system's own notification shade. */
+    /** Swipe down on home: open the system's notification shade (Accessibility first, reflection fallback). */
     private fun expandShade() {
+        if (TilesAccessibilityService.expandNotifications()) return
         try {
             val sb = getSystemService("statusbar")
             Class.forName("android.app.StatusBarManager").getMethod("expandNotificationsPanel").invoke(sb)
