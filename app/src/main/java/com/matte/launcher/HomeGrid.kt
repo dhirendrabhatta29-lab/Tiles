@@ -7,7 +7,8 @@ internal object HomeGrid {
                        val row: Int? = null)
     data class Position(val column: Int, val row: Int)
 
-    fun pack(requests: List<Request>): List<Position> {
+    fun pack(requests: List<Request>, columnsPerViewport: Int = COLUMNS_PER_VIEWPORT): List<Position> {
+        val cols = columnsPerViewport.coerceAtLeast(1)
         val positions = arrayOfNulls<Position>(requests.size)
         val placed = ArrayList<Int>()
         // Reserve saved positions before filling gaps with newly added or legacy tiles.
@@ -15,7 +16,7 @@ internal object HomeGrid {
             val request = requests[index]
             require(request.column >= 0 && request.width > 0 && request.height > 0)
             val lastColumn = if (request.fixedColumn || request.row != null) request.column else {
-                request.column + (COLUMNS_PER_VIEWPORT - request.width).coerceAtLeast(0)
+                request.column + (cols - request.width).coerceAtLeast(0)
             }
             var row = request.row?.coerceAtLeast(0) ?: 0
             var column: Int? = null

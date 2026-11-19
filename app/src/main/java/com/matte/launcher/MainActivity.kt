@@ -432,7 +432,12 @@ class MainActivity : Activity() {
 
     private val prefs by lazy { getSharedPreferences("matte", MODE_PRIVATE) }
     private lateinit var launcherPrefs: LauncherPrefs
+    private lateinit var dockManager: DockManager
     private lateinit var settingsOverlay: SettingsOverlay
+    private var floatingKeyboardBtn: View? = null
+    private var searchBarRow: LinearLayout? = null
+    private var searchClearBtn: TextView? = null
+    private var drawerFiltered = false
     private var launcherTheme = LauncherTheme.MATTE
     private var dynamicTheme: ThemeColors? = null
     private var wallpaperStops: IntArray = intArrayOf()
@@ -499,6 +504,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         launcherPrefs = LauncherPrefs(prefs)
+        dockManager = DockManager(prefs)
         if (prefs.contains("home_background")) customBackground = prefs.getInt("home_background", LauncherTheme.MATTE.colors.background)
         useWallpaper = launcherPrefs.useWallpaper
         customTiles = prefs.getBoolean("custom_tiles", false)
@@ -932,7 +938,12 @@ class MainActivity : Activity() {
                 else -> apps.firstOrNull { it.component.flattenToString() == item.key }?.component
             })
         }
-        for (id in DOCK_IDS) add(resolve(slots.getValue(id))?.component)
+        for (entry in dockManager.load(launcherPrefs.dockCount)) {
+            add(
+                if (entry.type == "slot") slots[entry.key]?.let { resolve(it)?.component }
+                else apps.firstOrNull { it.component.flattenToString() == entry.key }?.component
+            )
+        }
     }
 
     // ------------------------------------------------------------ ui
@@ -1018,23 +1029,58 @@ class MainActivity : Activity() {
         query = EditText(this).apply {
             setHintTextColor(colors.mutedText); setTextColor(colors.text); typeface = Typeface.MONOSPACE
             setTextSize(TypedValue.COMPLEX_UNIT_PX, u * 15)
-            setBackgroundColor(colors[TileTone.CHARCOAL].background); setSingleLine(); setPadding(px(14f), 0, px(14f), 0)
+            setBackgroundColor(Color.TRANSPARENT); setSingleLine(); setPadding(px(14f), 0, px(8f), 0)
             imeOptions = EditorInfo.IME_ACTION_GO
             addTextChangedListener(object : TextWatcher {
                 override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
-                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) { filter() }
+                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {
+                    searchClearBtn?.visibility = if (s.isNullOrEmpty()) View.GONE else View.VISIBLE
+                    filter()
+                }
                 override fun afterTextChanged(s: Editable?) {}
             })
             setOnEditorActionListener { _, action, key ->
                 val submit = if (key == null) action == EditorInfo.IME_ACTION_GO
                     else key.keyCode == KeyEvent.KEYCODE_ENTER && key.action == KeyEvent.ACTION_DOWN && key.repeatCount == 0
                 if (submit && drawerOpen && hasFocus() && resumed && text.isNotBlank()) {
-                    rows.firstOrNull { it.second.visibility == View.VISIBLE }?.second?.performClick()
+                    val topVisible = (0 until drawerList.childCount)
+                        .map { drawerList.getChildAt(it) }
+                        .firstOrNull { it.visibility == View.VISIBLE }
+                    topVisible?.performClick()
                 }
                 true
             }
         }
-        drawer.addView(query, LinearLayout.LayoutParams(-1, px(56f)))
+        val clearBtn = label("×", 20f, colors.mutedText).apply {
+            gravity = Gravity.CENTER
+            visibility = View.GONE
+            contentDescription = "Clear search"
+            setOnClickListener { query.setText("") }
+        }
+        searchClearBtn = clearBtn
+        val settingsIcon = ImageView(this).apply {
+            setImageResource(R.drawable.t_gear)
+            setColorFilter(colors.text)
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            setPadding(px(10f), px(10f), px(10f), px(10f))
+            contentDescription = "Tiles Settings"
+            setOnClickListener { openSettings(onboarding = false) }
+        }
+        val searchRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = BlurEffects.glassBackground(
+                baseColor = colors[TileTone.CHARCOAL].background,
+                blurIntensity = blurIntensity(),
+                cornerRadiusPx = px(14f).toFloat(),
+                isDark = colors.isDark
+            )
+            addView(query, LinearLayout.LayoutParams(0, -1, 1f))
+            addView(clearBtn, LinearLayout.LayoutParams(px(40f), -1))
+            addView(settingsIcon, LinearLayout.LayoutParams(px(46f), -1))
+        }
+        searchBarRow = searchRow
+        drawer.addView(searchRow, LinearLayout.LayoutParams(-1, px(54f)))
         drawerList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         drawerScroll = ScrollView(this).apply {
             isVerticalScrollBarEnabled = false
@@ -1108,12 +1154,70 @@ class MainActivity : Activity() {
     }
 
     private fun openDockCustomizeMenu() {
-        val entries = DOCK_IDS.map { id ->
-            val s = slots[id]!!
-            val current = resolve(s)?.label ?: id
-            entry("$id: $current") { pickFor(s) }
+        val dockEntries = dockManager.load(launcherPrefs.dockCount)
+        val menuEntries = ArrayList<Pair<String, () -> Unit>>()
+        dockEntries.forEachIndexed { idx, de ->
+            val slot = if (de.type == "slot") slots[de.key] else null
+            val app = if (slot != null) resolve(slot) else apps.firstOrNull { it.component.flattenToString() == de.key }
+            val currentName = app?.label ?: slot?.id ?: de.key.substringAfterLast('.')
+            menuEntries.add(entry("slot ${idx + 1}: $currentName") { pickDockApp(idx) })
         }
-        menu("customize dock", entries)
+        menuEntries.add(entry("reset dock to defaults") {
+            dockManager.reset()
+            rebuildHome()
+        })
+        menu("customize dock", menuEntries)
+    }
+
+    private fun pickDockApp(dockIndex: Int) {
+        openDrawer("choose app for dock slot ${dockIndex + 1}", { app ->
+            dockManager.setAppAt(dockIndex, app.component.flattenToString())
+            rebuildHome()
+        }, focusKeyboard = true)
+    }
+
+    private fun dockEntryMenu(index: Int, total: Int, app: App?, slot: Slot?) {
+        val e = ArrayList<Pair<String, () -> Unit>>()
+        if (app != null) {
+            for (sc in shortcutsFor(app).take(3)) {
+                e.add(entry((sc.shortLabel ?: "shortcut").toString().lowercase()) {
+                    try { la.startShortcut(sc, null, null) } catch (_: Exception) { }
+                })
+            }
+            e.add(entry("app info") {
+                try { la.startAppDetailsActivity(app.component, app.user, null, null) } catch (_: Exception) { }
+            })
+        }
+        e.add(entry("change dock app") { pickDockApp(index) })
+        if (index > 0) e.add(entry("move left") { dockManager.swap(index, index - 1); rebuildHome() })
+        if (index < total - 1) e.add(entry("move right") { dockManager.swap(index, index + 1); rebuildHome() })
+        e.add(entry("dock settings") { openSettings(onboarding = false) })
+        e.add(entry("reset dock") { dockManager.reset(); rebuildHome() })
+        menu(app?.label ?: slot?.id ?: "dock slot ${index + 1}", e)
+    }
+
+    private fun buildQuickKeyboardButton(size: Int, circular: Boolean): View {
+        val accentBg = colors[TileTone.CHARCOAL].background
+        return FrameLayout(this).apply {
+            background = if (circular) {
+                BlurEffects.glassBackground(colors.panel, blurIntensity(), size / 2f, colors.isDark, strongerScrim = true)
+            } else {
+                val radius = u * launcherPrefs.tileCornerRadiusDp.coerceAtLeast(10)
+                BlurEffects.glassBackground(accentBg, blurIntensity(), radius, colors.isDark)
+            }
+            clipToOutline = true
+            contentDescription = "Quick keyboard app search"
+            val icon = ImageView(this@MainActivity).apply {
+                setImageResource(R.drawable.t_keyboard)
+                setColorFilter(colors.text)
+                scaleType = ImageView.ScaleType.CENTER_INSIDE
+                val pad = (size * 0.24f).roundToInt()
+                setPadding(pad, pad, pad, pad)
+            }
+            addView(icon, FrameLayout.LayoutParams(-1, -1))
+            setOnClickListener { openDrawer(null, null, focusKeyboard = true) }
+            setOnLongClickListener { openSettings(onboarding = false); true }
+        }
     }
 
     private fun span(sz: String): Pair<Int, Int> = TileSize.fromKey(sz).let { it.width to it.height }
@@ -1142,7 +1246,7 @@ class MainActivity : Activity() {
         occupiedColumns = 0
         var rowsUsed = 0
         val requests = layoutRequests()
-        val positions = HomeGrid.pack(requests)
+        val positions = HomeGrid.pack(requests, launcherPrefs.gridColumns)
         for ((index, it) in items.withIndex()) {
             val (col, row) = positions[index]
             val request = requests[index]
@@ -1169,21 +1273,115 @@ class MainActivity : Activity() {
         grid.minimumWidth = canvasWidth
         homeScroll.layoutParams = homeScroll.layoutParams.apply { width = canvasWidth }
 
-        for ((i, id) in DOCK_IDS.withIndex()) {
-            val s = slots[id]!!
-            val app = resolve(s)
-            val (face, background) = appFace(app, false, s)
-            val host = tileHost(face, background)
-            bindNotificationBadge(host, app?.component)
-            host.setOnClickListener { if (app != null) launch(host, app) else pickFor(s) }
-            host.setOnLongClickListener { appMenu(app, null, s, false); true }
-            dock.addView(host, FrameLayout.LayoutParams(tile, tile).apply { leftMargin = px(12f) + i * step })
-            animViews.add(host)
-        }
+        rebuildDockUi()
         applyData()
         refreshAlarmLabels()
         refreshNotificationBadges()
         if (resumed && hasWindowFocus()) startLive()
+    }
+
+    private fun rebuildDockUi() {
+        floatingKeyboardBtn?.let { homeTiles.removeView(it) }
+        floatingKeyboardBtn = null
+        dock.removeAllViews()
+
+        val dockBottomMargin = px(12f)
+        val dockVisible = launcherPrefs.dockVisible
+        val showKb = launcherPrefs.quickKeyboardVisible
+
+        if (!dockVisible) {
+            dock.visibility = View.GONE
+            (homePan.layoutParams as FrameLayout.LayoutParams).bottomMargin = px(8f)
+            homePan.requestLayout()
+            if (showKb) {
+                val fabSize = px(54f)
+                val fab = buildQuickKeyboardButton(fabSize, circular = true)
+                homeTiles.addView(fab, FrameLayout.LayoutParams(fabSize, fabSize, Gravity.BOTTOM or Gravity.END).apply {
+                    rightMargin = px(16f)
+                    bottomMargin = px(16f)
+                })
+                floatingKeyboardBtn = fab
+            }
+            return
+        }
+
+        dock.visibility = View.VISIBLE
+        val entries = dockManager.load(launcherPrefs.dockCount)
+        val totalSlots = entries.size + if (showKb) 1 else 0
+        val innerPad = px(10f)
+        val dockGap = px(8f)
+        val availW = (pageWidth() - px(24f) - innerPad * 2 - dockGap * (totalSlots - 1)).coerceAtLeast(1)
+        val iconSize = min(min(tile, px(64f)), availW / totalSlots.coerceAtLeast(1)).coerceAtLeast(px(40f))
+        val dockHeight = iconSize + innerPad * 2
+
+        dock.background = BlurEffects.glassBackground(
+            baseColor = colors.panel,
+            blurIntensity = blurIntensity(),
+            cornerRadiusPx = px(22f).toFloat(),
+            isDark = colors.isDark
+        )
+        dock.clipToOutline = true
+        dock.layoutParams = (dock.layoutParams as FrameLayout.LayoutParams).apply {
+            height = dockHeight
+            leftMargin = px(12f)
+            rightMargin = px(12f)
+            bottomMargin = dockBottomMargin
+        }
+        (homePan.layoutParams as FrameLayout.LayoutParams).bottomMargin = dockHeight + dockBottomMargin + px(8f)
+        homePan.requestLayout()
+
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(innerPad, innerPad, innerPad, innerPad)
+        }
+        for ((i, entry) in entries.withIndex()) {
+            val slot = if (entry.type == "slot") slots[entry.key] else null
+            val app = if (slot != null) resolve(slot) else apps.firstOrNull { it.component.flattenToString() == entry.key }
+            val (face, background) = appFace(app, false, slot)
+            val host = tileHost(face, background)
+            bindNotificationBadge(host, app?.component)
+            host.setOnClickListener {
+                if (app != null) launch(host, app)
+                else if (slot != null) pickFor(slot)
+                else pickDockApp(i)
+            }
+            host.setOnLongClickListener { dockEntryMenu(i, entries.size, app, slot); true }
+            // Drag-and-drop a tile from the Home grid onto a dock slot to pin it there
+            host.setOnDragListener { v, event ->
+                val drag = event.localState as? TileDrag ?: return@setOnDragListener false
+                when (event.action) {
+                    DragEvent.ACTION_DRAG_ENTERED -> { v.scaleX = 1.08f; v.scaleY = 1.08f }
+                    DragEvent.ACTION_DRAG_EXITED, DragEvent.ACTION_DRAG_ENDED -> { v.scaleX = 1f; v.scaleY = 1f }
+                    DragEvent.ACTION_DROP -> {
+                        v.scaleX = 1f; v.scaleY = 1f
+                        val draggedApp = when (drag.item.type) {
+                            "app" -> appFor(drag.item)
+                            "slot" -> slots[drag.item.key]?.let { resolve(it) }
+                            else -> null
+                        }
+                        if (draggedApp != null) {
+                            dockManager.setAppAt(i, draggedApp.component.flattenToString())
+                            v.post { rebuildHome() }
+                            Toast.makeText(this, "Pinned ${draggedApp.label} to dock", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }
+                true
+            }
+            row.addView(host, LinearLayout.LayoutParams(iconSize, iconSize).apply {
+                if (i > 0) marginStart = dockGap
+            })
+            animViews.add(host)
+        }
+        if (showKb) {
+            val kbBtn = buildQuickKeyboardButton(iconSize, circular = false)
+            row.addView(kbBtn, LinearLayout.LayoutParams(iconSize, iconSize).apply {
+                marginStart = dockGap
+            })
+            animViews.add(kbBtn)
+        }
+        dock.addView(row, FrameLayout.LayoutParams(-1, -1))
     }
 
     private fun styleTile(view: View, background: Int) {
@@ -1329,8 +1527,12 @@ class MainActivity : Activity() {
                 val s = slots[it.key] ?: wxSlot
                 val app = resolve(s)
                 val over = styleOverride(it)
-                if (span(it.sz).first >= 2 && span(it.sz).second >= 2) {
+                val (sw, sh) = span(it.sz)
+                if (sw >= 2 && sh >= 2) {
                     return largeAppTile(it, app, s, over ?: appTileColors(app, s))
+                }
+                if (sw >= 2 && sh == 1) {
+                    return wideAppTile(it, app, s, over ?: appTileColors(app, s))
                 }
                 val (face, background) = appFace(app, true, s, colorsOverride = over)
                 val host = tileHost(face, background)
@@ -1363,8 +1565,12 @@ class MainActivity : Activity() {
             else -> {
                 val app = apps.firstOrNull { a -> a.component.flattenToString() == it.key }
                 val over = styleOverride(it)
-                if (app != null && span(it.sz).first >= 2 && span(it.sz).second >= 2) {
+                val (sw, sh) = span(it.sz)
+                if (app != null && sw >= 2 && sh >= 2) {
                     return largeAppTile(it, app, null, over ?: appTileColors(app))
+                }
+                if (app != null && sw >= 2 && sh == 1) {
+                    return wideAppTile(it, app, null, over ?: appTileColors(app))
                 }
                 val fb = appFace(app, true, missingLabel = it.key.substringBefore('/').substringAfterLast('.'), colorsOverride = over)
                 val host = tileHost(fb.first, fb.second)
@@ -1476,6 +1682,38 @@ class MainActivity : Activity() {
             else "Original tiles. Move and resize are on.", Toast.LENGTH_LONG).show()
         rebuildHome()
         if (folderOpen) rebuildFolderPages()
+    }
+
+    /** OxygenOS-style 2x1 wide card with icon, title, contextual subtitle, and quick action pill. */
+    private fun wideAppTile(item: Item, app: App?, slot: Slot?, tileColors: TileColors): TileHost {
+        val iconFace = appFace(app, false, slot, colorsOverride = tileColors).first.apply {
+            setBackgroundColor(Color.TRANSPARENT)
+        }
+        val title = app?.label ?: slot?.label ?: "App"
+        val shortcuts = if (app != null) shortcutsFor(app).filter { it.isEnabled } else emptyList()
+        val firstSc = shortcuts.firstOrNull()
+        val hostRef = arrayOfNulls<TileHost>(1)
+        val quickAction = when {
+            slot?.id == "settings" -> LargeTileRenderer.Action("Tiles") { openSettings(onboarding = false) }
+            firstSc != null -> LargeTileRenderer.Action((firstSc.shortLabel ?: "Action").toString()) {
+                hostRef[0]?.let { h -> runTileLaunch(h) { startTileShortcut(firstSc) } }
+            }
+            app != null -> LargeTileRenderer.Action("Open") {
+                hostRef[0]?.let { h -> launch(h, app) }
+            }
+            slot != null -> LargeTileRenderer.Action("Pick") { pickFor(slot) }
+            else -> null
+        }
+        val subtitle = LargeTileRenderer.wideSubtitle(app, shortcuts, null)
+        val card = LargeTileRenderer.buildWideCard(this, u, iconFace, title, subtitle, tileColors, quickAction)
+        val host = tileHost(card, tileColors.background)
+        hostRef[0] = host
+        host.liveHeader = iconFace
+        host.setOnClickListener {
+            if (app != null) launch(host, app) else if (slot != null) pickFor(slot)
+        }
+        host.setOnLongClickListener { itemMenu(item); true }
+        return host
     }
 
     private fun largeAppTile(item: Item, app: App?, slot: Slot?, tileColors: TileColors): TileHost {
@@ -1645,51 +1883,80 @@ class MainActivity : Activity() {
 
     private fun folderTile(item: Item, folder: LiveFolder): TileHost {
         val accent = tileColors(TileTone.ACCENT)
-        val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val (sw, sh) = span(item.sz)
+        val isLargeFolder = sw >= 2 && sh >= 2
         val positions = HomeGrid.pack(folderRequests(folder))
         val preview = folder.apps.zip(positions)
             .sortedWith(compareBy({ it.second.row }, { it.second.column }))
-            .mapNotNull { (item, _) -> appFor(item) }.take(9)
-        repeat(3) { y ->
-            val row = LinearLayout(this)
-            repeat(3) { x ->
-                val app = preview.getOrNull(y * 3 + x)
-                val square = if (app != null) {
-                    val (face, background) = appFace(app, false)
-                    TileHost(this).apply {
-                        setBackgroundColor(background)
-                        this.face = face
-                        badgeInk = TileColors.solid(background).foreground
-                        addView(face, FrameLayout.LayoutParams(-1, -1))
-                        bindNotificationBadge(this, app.component, small = true)
-                        folderPreviewViews.add(this)
+            .mapNotNull { (member, _) -> appFor(member) }
+
+        val content: LinearLayout = if (isLargeFolder) {
+            LargeTileRenderer.buildLargeFolderContent(
+                context = this,
+                u = u,
+                folderName = folder.name,
+                apps = preview,
+                tileColors = accent,
+                cornerRadiusPx = u * launcherPrefs.tileCornerRadiusDp,
+                createAppIcon = { a, withLbl -> appFace(a, withLbl) },
+                onLaunchApp = { tileHostView, a -> launch(tileHostView, a) },
+                onOpenFolder = { openFolder(folder) },
+                onBindBadge = { tileHostView, a, small -> bindNotificationBadge(tileHostView, a.component, small = small) },
+                previewViewsOut = folderPreviewViews
+            )
+        } else {
+            LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                val compact = preview.take(9)
+                repeat(3) { y ->
+                    val row = LinearLayout(this@MainActivity)
+                    repeat(3) { x ->
+                        val app = compact.getOrNull(y * 3 + x)
+                        val square = if (app != null) {
+                            val (face, background) = appFace(app, false)
+                            TileHost(this@MainActivity).apply {
+                                setBackgroundColor(background)
+                                this.face = face
+                                badgeInk = TileColors.solid(background).foreground
+                                addView(face, FrameLayout.LayoutParams(-1, -1))
+                                bindNotificationBadge(this, app.component, small = true)
+                                folderPreviewViews.add(this)
+                            }
+                        } else View(this@MainActivity).apply { setBackgroundColor(0x14000000) }
+                        row.addView(square, LinearLayout.LayoutParams(0, -1, 1f).apply {
+                            if (x > 0) leftMargin = max(1, px(1f))
+                        })
                     }
-                } else View(this).apply { setBackgroundColor(0x14000000) }
-                row.addView(square, LinearLayout.LayoutParams(0, -1, 1f).apply {
-                    if (x > 0) leftMargin = max(1, px(1f))
-                })
+                    addView(row, LinearLayout.LayoutParams(-1, 0, 1f).apply {
+                        if (y > 0) topMargin = max(1, px(1f))
+                    })
+                }
+                addView(label(folder.name, 12f, accent.foreground).apply {
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(px(6f), 0, px(6f), 0)
+                    setSingleLine()
+                    ellipsize = TextUtils.TruncateAt.END
+                }, LinearLayout.LayoutParams(-1, px(24f)))
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
             }
-            content.addView(row, LinearLayout.LayoutParams(-1, 0, 1f).apply {
-                if (y > 0) topMargin = max(1, px(1f))
-            })
         }
-        content.addView(label(folder.name, 14f, accent.foreground).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(px(8f), 0, px(8f), 0)
-            setSingleLine()
-            ellipsize = TextUtils.TruncateAt.END
-        }, LinearLayout.LayoutParams(-1, px(28f)))
-        content.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
         return tileHost(content, accent.background).apply {
             contentDescription = "${folder.name}, ${folder.apps.size} apps"
             setOnClickListener { openFolder(folder) }
             setOnLongClickListener {
-                menu(folder.name, listOf(
-                    entry("add app") { openDrawerMulti("add apps to ${folder.name}") { addFolderApps(folder, it) } },
-                    entry("move folder tile") { editItem = item; rebuildHome() },
-                    entry("rename folder") { askFolderName(folder.name) { folder.name = it; updateFolders() } },
-                    entry("remove folder") { requestTileRemoval(item) }
-                ).filter { !customTiles || it.first != "move folder tile" })
+                val entries = ArrayList<Pair<String, () -> Unit>>()
+                entries.add(entry("add app") { openDrawerMulti("add apps to ${folder.name}") { addFolderApps(folder, it) } })
+                if (!customTiles) {
+                    if (isLargeFolder) {
+                        entries.add(entry("shrink to compact folder (1×1)") { resizeTile(item, TileSize(1, 1)) })
+                    } else {
+                        entries.add(entry("expand to large folder (2×2)") { resizeTile(item, TileSize(2, 2)) })
+                    }
+                    entries.add(entry("move / resize folder") { editItem = item; rebuildHome() })
+                }
+                entries.add(entry("rename folder") { askFolderName(folder.name) { folder.name = it; updateFolders() } })
+                entries.add(entry("remove folder") { requestTileRemoval(item) })
+                menu(folder.name, entries)
                 true
             }
         }
@@ -1979,6 +2246,7 @@ class MainActivity : Activity() {
 
     private fun rebuildDrawer() {
         drawerList.removeAllViews()
+        drawerFiltered = false
         rows = ArrayList()
         val sq = px(46f)
         for (app in apps) {
@@ -2087,28 +2355,68 @@ class MainActivity : Activity() {
     }
 
     private fun filter() {
-        val q = query.text.toString().trim().lowercase()
-        for (r in rows) r.second.visibility = if (q.isEmpty() || r.first.label.lowercase().contains(q)) View.VISIBLE else View.GONE
+        val q = query.text.toString().trim()
+        if (q.isEmpty()) {
+            if (drawerFiltered) {
+                drawerList.removeAllViews()
+                for (r in rows) {
+                    r.second.visibility = View.VISIBLE
+                    drawerList.addView(r.second)
+                }
+                drawerFiltered = false
+            } else {
+                for (r in rows) r.second.visibility = View.VISIBLE
+            }
+            drawerScroll.scrollTo(0, 0)
+            return
+        }
+        drawerFiltered = true
+        val scored = rows.map { pair ->
+            pair to AppSearchEngine.matchScore(pair.first.label, q)
+        }
+        val matched = scored.filter { it.second > 0 }.sortedByDescending { it.second }
+        drawerList.removeAllViews()
+        for ((pair, _) in matched) {
+            pair.second.visibility = View.VISIBLE
+            drawerList.addView(pair.second)
+        }
         drawerScroll.scrollTo(0, 0)
     }
 
-    private fun openDrawer(hint: String?, pick: ((App) -> Unit)?) {
+    private fun openDrawer(hint: String?, pick: ((App) -> Unit)?, focusKeyboard: Boolean = false) {
         onPick = pick
         multiPick = null
         generalSelect = false
         clearSelection()
         drawerOpen = true
-        query.hint = hint ?: "search apps"
+        query.hint = hint ?: "search apps · T9 / fuzzy"
         query.setText("")
         drawer.animate().cancel()
         if (drawer.visibility != View.VISIBLE) drawer.translationY = root.height.toFloat()
         drawer.visibility = View.VISIBLE
-        // The keyboard appears only when the search field is tapped.
-        query.clearFocus()
-        drawer.requestFocus()
+        if (focusKeyboard) {
+            query.requestFocus()
+            showKeyboard()
+        } else {
+            // The keyboard appears only when the search field or quick keyboard button is tapped.
+            query.clearFocus()
+            drawer.requestFocus()
+        }
         updateSelectionBar()
         updateOverlayBlur()
         drawer.animate().translationY(0f).setDuration(DRAWER_OPEN_MS).setInterpolator(DecelerateInterpolator(1.6f)).start()
+    }
+
+    private fun showKeyboard() {
+        query.post {
+            if (!drawerOpen || isDestroyed) return@post
+            query.requestFocus()
+            if (Build.VERSION.SDK_INT >= 30) {
+                window.insetsController?.show(WindowInsets.Type.ime())
+            }
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            imm.showSoftInput(query, InputMethodManager.SHOW_IMPLICIT)
+        }
     }
 
     private fun openDrawerMulti(hint: String, done: (List<App>) -> Unit) {
@@ -2602,7 +2910,12 @@ class MainActivity : Activity() {
         selectionBar.setBackgroundColor(colors.panel)
         query.setTextColor(colors.text)
         query.setHintTextColor(colors.mutedText)
-        query.setBackgroundColor(colors[TileTone.CHARCOAL].background)
+        searchBarRow?.background = BlurEffects.glassBackground(
+            baseColor = colors[TileTone.CHARCOAL].background,
+            blurIntensity = blurIntensity(),
+            cornerRadiusPx = px(14f).toFloat(),
+            isDark = colors.isDark
+        )
         rebuildHome()
         rebuildDrawer()
     }
@@ -2730,10 +3043,26 @@ class MainActivity : Activity() {
             })
             if (fromDrawer && onPick == null && !multiActive()) e.add(entry("select multiple") { startGeneralSelect(app) })
         }
-        if (it != null && !customTiles) e.add(entry(if (canResize(it)) "move / resize tile" else "move tile") {
-            editItem = it
-            rebuildHome()
-        })
+        if (it != null && !customTiles) {
+            if (canResize(it) && it.type in setOf("slot", "app")) {
+                val curSize = TileSize.fromKey(it.sz)
+                val isLarge = curSize.width >= 2 || curSize.height >= 2
+                if (isLarge) {
+                    e.add(entry("shrink to standard (1×1)") { resizeTile(it, TileSize(1, 1)) })
+                    val alt = if (curSize == TileSize(2, 2)) TileSize(2, 1) else TileSize(2, 2)
+                    e.add(entry("switch to ${alt.label}") { resizeTile(it, alt) })
+                } else {
+                    val primary = TileSize.fromKey(launcherPrefs.largeTileDefault)
+                    val secondary = if (primary == TileSize(2, 2)) TileSize(2, 1) else TileSize(2, 2)
+                    e.add(entry("expand to large (${primary.label})") { resizeTile(it, primary) })
+                    e.add(entry("expand to ${secondary.label}") { resizeTile(it, secondary) })
+                }
+            }
+            e.add(entry(if (canResize(it)) "move / resize tile" else "move tile") {
+                editItem = it
+                rebuildHome()
+            })
+        }
         if (it != null && customTiles && canStyle(it)) addStyleEntries(e, it)
         if (s != null) e.add(entry("change app") { pickFor(s) })
         if (it != null) e.add(entry("remove from home") { removeItem(it) })
@@ -2760,7 +3089,7 @@ class MainActivity : Activity() {
         rebuildHome()
     }
 
-    private fun canResize(item: Item) = item.type in setOf("slot", "app", "widget")
+    private fun canResize(item: Item) = item.type in setOf("slot", "app", "widget", "folder")
 
     private fun showTileSizes(anchor: View, item: Item, maxWidth: Int = 8,
                               choose: (TileSize) -> Unit = { resizeTile(item, it) }) {
