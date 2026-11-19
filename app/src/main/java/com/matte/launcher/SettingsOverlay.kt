@@ -37,6 +37,7 @@ internal class SettingsOverlay(
         fun onAppearanceChanged(rebuildLayout: Boolean)
         fun onLayoutConfigChanged()
         fun onDockConfigChanged()
+        fun onUsageTilingChanged(enabled: Boolean)
         fun onOpenBackgroundMenu()
         fun onOpenSolidColorMenu()
         fun onToggleCustomTiles()
@@ -336,6 +337,20 @@ internal class SettingsOverlay(
         tilesCard.addView(divider(theme))
 
         tilesCard.addView(toggleRow(
+            "Usage-Based Tiling",
+            if (PermissionsHelper.isUsageAccessGranted(activity))
+                "Most-used apps get bigger tiles and move to the front. Saved layout is untouched; turn off to restore it."
+            else "Needs Usage Access (see Permissions below). Until granted your manual layout is used.",
+            prefs.usageTilingEnabled,
+            theme
+        ) { on ->
+            prefs.usageTilingEnabled = on
+            callbacks.onUsageTilingChanged(on)
+            rebuild()
+        })
+        tilesCard.addView(divider(theme))
+
+        tilesCard.addView(toggleRow(
             "Custom Tile Style Mode",
             "Long-press tiles to assign custom color or image (pauses move/resize while on)",
             callbacks.customTilesActive(),
@@ -372,7 +387,7 @@ internal class SettingsOverlay(
         dockCard.addView(chipGroupRow(
             title = "Dock Icon Count",
             subtitle = "Number of app slots pinned in the bottom dock",
-            options = listOf("3 Apps" to 3, "4 Apps" to 4, "5 Apps" to 5),
+            options = (4..10).map { "$it Apps" to it },
             selectedValue = prefs.dockCount,
             theme = theme
         ) { count ->
@@ -393,6 +408,16 @@ internal class SettingsOverlay(
         })
         dockCard.addView(divider(theme))
 
+        dockCard.addView(toggleRow(
+            "Niagara-Style Alphabet Slider",
+            "Right-edge scrub bar in All Apps for fast alphabetical jumping",
+            prefs.alphabetSliderEnabled,
+            theme
+        ) { on ->
+            prefs.alphabetSliderEnabled = on
+        })
+        dockCard.addView(divider(theme))
+
         dockCard.addView(buttonRow(
             theme,
             "Customize Dock Apps" to { close(true); callbacks.onCustomizeDock() }
@@ -408,6 +433,7 @@ internal class SettingsOverlay(
             options = listOf(
                 "Morph" to LauncherPrefs.LAUNCH_MORPH,
                 "Tile Turn" to LauncherPrefs.LAUNCH_TURN,
+                "Slow Expand + Dock Return" to LauncherPrefs.LAUNCH_EXPAND,
                 "Slide" to LauncherPrefs.LAUNCH_SLIDE,
                 "None" to LauncherPrefs.LAUNCH_NONE
             ),

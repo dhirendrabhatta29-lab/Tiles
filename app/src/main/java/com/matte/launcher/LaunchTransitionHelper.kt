@@ -36,7 +36,8 @@ internal object LaunchTransitionHelper {
         launchStyle: String,
         directHandoff: Boolean
     ): Bundle {
-        if (directHandoff || launchStyle == LauncherPrefs.LAUNCH_TURN || launchStyle == LauncherPrefs.LAUNCH_NONE) {
+        if (directHandoff || launchStyle == LauncherPrefs.LAUNCH_TURN || launchStyle == LauncherPrefs.LAUNCH_NONE ||
+            launchStyle == LauncherPrefs.LAUNCH_EXPAND) {
             return ActivityOptions.makeCustomAnimation(activity, 0, 0).toBundle()
         }
         if (launchStyle == LauncherPrefs.LAUNCH_SLIDE) {

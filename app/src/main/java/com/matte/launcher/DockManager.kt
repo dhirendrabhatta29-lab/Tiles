@@ -17,11 +17,14 @@ internal class DockManager(private val prefs: SharedPreferences) {
 
     companion object {
         private const val KEY_DOCK = "dock_entries_v2"
-        val DEFAULT_SLOTS = listOf("phone", "messaging", "web", "camera", "photos")
+        const val MAX = 10
+        const val MIN = 4
+        val DEFAULT_SLOTS = listOf("phone", "messaging", "web", "camera", "photos",
+            "music", "mail", "calendar", "clock", "settings")
     }
 
     fun load(count: Int): MutableList<Entry> {
-        val targetCount = count.coerceIn(3, 5)
+        val targetCount = count.coerceIn(MIN, MAX)
         val stored = ArrayList<Entry>()
         val raw = prefs.getString(KEY_DOCK, null)
         if (raw != null) {
@@ -39,7 +42,7 @@ internal class DockManager(private val prefs: SharedPreferences) {
         }
         // Backfill missing positions from defaults up to 5
         for (slotId in DEFAULT_SLOTS) {
-            if (stored.size >= 5) break
+            if (stored.size >= MAX) break
             if (stored.none { it.type == "slot" && it.key == slotId }) {
                 stored.add(Entry("slot", slotId))
             }
@@ -47,11 +50,11 @@ internal class DockManager(private val prefs: SharedPreferences) {
         return stored.take(targetCount).toMutableList()
     }
 
-    private fun loadAll(): MutableList<Entry> = load(5)
+    private fun loadAll(): MutableList<Entry> = load(MAX)
 
     fun saveAll(entries: List<Entry>) {
         val arr = JSONArray()
-        for (e in entries.take(5)) {
+        for (e in entries.take(MAX)) {
             arr.put(JSONObject().put("t", e.type).put("k", e.key))
         }
         prefs.edit().putString(KEY_DOCK, arr.toString()).apply()

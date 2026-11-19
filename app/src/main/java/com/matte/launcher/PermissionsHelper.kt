@@ -23,6 +23,7 @@ internal object PermissionsHelper {
         NOTIFICATIONS,
         LOCATION,
         WALLPAPER_MEDIA,
+        USAGE_ACCESS,
         ACCESSIBILITY
     }
 
@@ -69,6 +70,14 @@ internal object PermissionsHelper {
             actionLabel = "Grant"
         ),
         Status(
+            kind = Kind.USAGE_ACCESS,
+            title = "Usage Access",
+            reason = "Optional: lets Usage-Based Tiling size and order tiles by how much you use each app. Without it, tiles stay in your manual layout.",
+            granted = isUsageAccessGranted(context),
+            optional = true,
+            actionLabel = "Allow Access"
+        ),
+        Status(
             kind = Kind.ACCESSIBILITY,
             title = "Accessibility Service",
             reason = "Optional: enables double-tap to lock screen, smooth notification shade pull-down, and Recents gestures.",
@@ -111,6 +120,28 @@ internal object PermissionsHelper {
         return context.checkSelfPermission(perm) == PackageManager.PERMISSION_GRANTED
     }
 
+    fun isUsageAccessGranted(context: Context): Boolean = try {
+        val ops = context.getSystemService(Context.APP_OPS_SERVICE) as android.app.AppOpsManager
+        @Suppress("DEPRECATION")
+        val mode = if (Build.VERSION.SDK_INT >= 29) {
+            ops.unsafeCheckOpNoThrow(android.app.AppOpsManager.OPSTR_GET_USAGE_STATS,
+                android.os.Process.myUid(), context.packageName)
+        } else {
+            ops.checkOpNoThrow(android.app.AppOpsManager.OPSTR_GET_USAGE_STATS,
+                android.os.Process.myUid(), context.packageName)
+        }
+        mode == android.app.AppOpsManager.MODE_ALLOWED
+    } catch (_: Exception) {
+        false
+    }
+
+    fun openUsageAccessSettings(activity: Activity) {
+        val direct = Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS, Uri.fromParts("package", activity.packageName, null))
+        if (!launchIntent(activity, direct) && !launchIntent(activity, Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))) {
+            Toast.makeText(activity, "Open Usage access in Android Settings", Toast.LENGTH_LONG).show()
+        }
+    }
+
     fun isAccessibilityGranted(context: Context): Boolean {
         if (TilesAccessibilityService.isRunning()) return true
         val enabled = try {
@@ -151,6 +182,7 @@ internal object PermissionsHelper {
                     activity.requestPermissions(arrayOf(perm), REQ_PERM_MEDIA)
                 }
             }
+            Kind.USAGE_ACCESS -> openUsageAccessSettings(activity)
             Kind.ACCESSIBILITY -> showAccessibilityDisclosure(activity)
         }
     }

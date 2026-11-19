@@ -76,8 +76,16 @@ internal class LauncherPrefs(val raw: SharedPreferences) {
         set(v) = raw.edit().putBoolean("dock_visible", v).apply()
 
     var dockCount: Int
-        get() = raw.getInt("dock_count", 4).coerceIn(3, 5)
-        set(v) = raw.edit().putInt("dock_count", v.coerceIn(3, 5)).apply()
+        get() = raw.getInt("dock_count", 4).coerceIn(4, 10)
+        set(v) = raw.edit().putInt("dock_count", v.coerceIn(4, 10)).apply()
+
+    var alphabetSliderEnabled: Boolean
+        get() = raw.getBoolean("alphabet_slider_enabled", true)
+        set(v) = raw.edit().putBoolean("alphabet_slider_enabled", v).apply()
+
+    var usageTilingEnabled: Boolean
+        get() = raw.getBoolean("usage_tiling_enabled", false)
+        set(v) = raw.edit().putBoolean("usage_tiling_enabled", v).apply()
 
     var quickKeyboardVisible: Boolean
         get() = raw.getBoolean("quick_keyboard_visible", true)
@@ -118,6 +126,7 @@ internal class LauncherPrefs(val raw: SharedPreferences) {
         const val LAUNCH_MORPH = "morph"
         const val LAUNCH_TURN = "turn"
         const val LAUNCH_SLIDE = "slide"
+        const val LAUNCH_EXPAND = "expand"
         const val LAUNCH_NONE = "none"
     }
 }

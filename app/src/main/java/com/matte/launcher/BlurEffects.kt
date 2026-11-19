@@ -78,7 +78,8 @@ internal object BlurEffects {
         blurIntensity: Int,
         cornerRadiusPx: Float,
         isDark: Boolean = true,
-        strongerScrim: Boolean = false
+        strongerScrim: Boolean = false,
+        outline: Boolean = true
     ): GradientDrawable {
         val intensity = blurIntensity.coerceIn(0, 100)
         val alpha = when {
@@ -97,7 +98,7 @@ internal object BlurEffects {
         return GradientDrawable().apply {
             setColor(fill)
             cornerRadius = cornerRadiusPx
-            setStroke(1, stroke)
+            if (outline) setStroke(1, stroke)
         }
     }
 

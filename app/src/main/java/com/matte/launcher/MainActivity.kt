@@ -102,6 +102,9 @@ class Item(var type: String, var key: String, var sz: String, var wid: Int,
            var column: Int = 0, var fixedColumn: Boolean = false, var row: Int? = null,
            var styleColor: Int? = null, var styleImage: String? = null) {
     val transitionName = "tile-${View.generateViewId()}"
+    /** Display-only size set by usage tiling; never saved. */
+    var displaySz: String? = null
+    val effSz: String get() = displaySz ?: sz
 }
 
 private class LiveFolder(val id: String, var name: String, val apps: MutableList<Item> = ArrayList())
@@ -451,6 +454,11 @@ class MainActivity : Activity() {
     private var floatingKeyboardBtn: View? = null
     private var searchBarRow: LinearLayout? = null
     private var searchClearBtn: TextView? = null
+    private var collapseKbBtn: TextView? = null
+    private var alphabetSlider: AlphabetSlider? = null
+    private var imeVisible = false
+    private lateinit var expandLaunch: ExpandLaunchController
+    private var expandApp: App? = null
     private var drawerFiltered = false
     private var launcherTheme = LauncherTheme.MATTE
     private var dynamicTheme: ThemeColors? = null
@@ -513,10 +521,21 @@ class MainActivity : Activity() {
         }
     }
 
+    /** Let the window extend into the notch / camera cutout on every edge it can (API 28+). */
+    private fun applyDisplayCutoutMode() {
+        if (Build.VERSION.SDK_INT < 28) return
+        val params = window.attributes
+        params.layoutInDisplayCutoutMode = if (Build.VERSION.SDK_INT >= 30)
+            WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+        else WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        window.attributes = params
+    }
+
     // ------------------------------------------------------------ lifecycle
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        applyDisplayCutoutMode()
         launcherPrefs = LauncherPrefs(prefs)
         dockManager = DockManager(prefs)
         liveContentHub = LiveContentHub(this, prefs) { runOnUiThread { if (!isDestroyed) applyData() } }
@@ -621,6 +640,7 @@ class MainActivity : Activity() {
         pausedForExternal = false
         resumed = true
         refreshDynamicPalette()
+        if (launcherPrefs.usageTilingEnabled) UsageTiling.refreshIfStale(this) { if (!isDestroyed) rebuildHome() }
         loadWeather()
         loadEvent()
         if (folderOpen) rebuildFolderPages()
@@ -629,7 +649,29 @@ class MainActivity : Activity() {
         refreshAlarmLabels()
         if (useWallpaper) applyHomeBackground()
         updateOverlayBlur()
-        if (returningFromExternal && ::launcherPrefs.isInitialized && launcherPrefs.recentsSmoothEnabled &&
+        if (returningFromExternal && ::expandLaunch.isInitialized && expandLaunch.hasOverlay) {
+            needsEntrance = false
+            val copy = buildReturnCopyTile(expandApp)
+            val cols = launcherPrefs.gridColumns
+            val dockH = if (launcherPrefs.dockVisible) {
+                ((dock.layoutParams as? FrameLayout.LayoutParams)?.height?.takeIf { it > 0 } ?: tile) + px(12f)
+            } else px(12f)
+            val hostH = homeTiles.height.takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
+            val stageTop = (hostH - dockH - tile - px(10f)).coerceAtLeast(px(16f))
+            val dockCenterY = hostH - dockH / 2f
+            expandLaunch.stageReturn(
+                copy = copy,
+                tile = tile,
+                gap = gap,
+                leftEdge = px(12f),
+                top = stageTop,
+                slots = cols,
+                durationMs = launcherPrefs.launchSpeedMs.toLong().coerceIn(240L, 520L),
+                dockCenterY = dockCenterY,
+                holdMs = 2200L,
+                zoneColor = (colors.panel and 0x00FFFFFF) or 0x44000000
+            )
+        } else if (returningFromExternal && ::launcherPrefs.isInitialized && launcherPrefs.recentsSmoothEnabled &&
             launcherPrefs.launchStyle != LauncherPrefs.LAUNCH_TURN && !folderOpen && !drawerOpen &&
             (!::settingsOverlay.isInitialized || !settingsOverlay.showing) && ValueAnimator.areAnimatorsEnabled()) {
             needsEntrance = false
@@ -689,6 +731,7 @@ class MainActivity : Activity() {
         if (::lockAnimation.isInitialized) lockAnimation.dispose()
         val observer = root.viewTreeObserver
         if (observer.isAlive) observer.removeOnPreDrawListener(homePreDrawListener)
+        if (::expandLaunch.isInitialized) expandLaunch.clear()
         clearHomeMotion()
         cancelLaunchMotion()
         super.onDestroy()
@@ -790,7 +833,7 @@ class MainActivity : Activity() {
                 dragDownRawX = e.rawX
                 dragDownRawY = e.rawY
                 swallow = false
-                dragCandidate = if (!customTiles && !drawerOpen && menuView == null && (folderOpen || editItem == null)) {
+                dragCandidate = if (!customTiles && !usageActive() && !drawerOpen && menuView == null && (folderOpen || editItem == null)) {
                     turnViews().filterIsInstance<TileHost>().lastOrNull { host ->
                         val item = host.draggableItem
                         item != null && item.type != "widget" && host.getGlobalVisibleRect(bounds) &&
@@ -848,7 +891,7 @@ class MainActivity : Activity() {
                     c.action = MotionEvent.ACTION_CANCEL
                     super.dispatchTouchEvent(c)
                     c.recycle()
-                    if (up) openDrawer(null, null) else closeDrawer()
+                    if (up) openDrawer(null, null, true) else closeDrawer()
                     return true
                 }
             }
@@ -1016,16 +1059,21 @@ class MainActivity : Activity() {
     }
 
     private fun buildUi() {
+        // Draw behind system bars and the camera cutout so there are no dead bars or cut-off backgrounds.
+        if (Build.VERSION.SDK_INT in 30..34) window.setDecorFitsSystemWindows(false)
         root = FrameLayout(this).apply {
             setBackgroundColor(rootColor())
             setOnApplyWindowInsetsListener { v, i ->
-                if (Build.VERSION.SDK_INT >= 35) {
-                    val bars = i.getInsetsIgnoringVisibility(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
+                if (Build.VERSION.SDK_INT >= 30) {
+                    // System bars only: the display cutout is deliberately NOT inset, the UI extends past it.
+                    val bars = i.getInsetsIgnoringVisibility(WindowInsets.Type.systemBars())
                     v.setPadding(0, bars.top, 0, bars.bottom)
                     if (::drawer.isInitialized) {
                         val keyboard = i.getInsets(WindowInsets.Type.ime())
                         drawer.setPadding(px(12f), px(10f), px(12f), max(0, keyboard.bottom - bars.bottom))
                     }
+                    val visible = i.isVisible(WindowInsets.Type.ime())
+                    if (visible != imeVisible) { imeVisible = visible; updateCollapseButton() }
                 } else {
                     @Suppress("DEPRECATION")
                     v.setPadding(0, i.systemWindowInsetTop, 0, i.systemWindowInsetBottom)
@@ -1038,6 +1086,7 @@ class MainActivity : Activity() {
 
         home = FrameLayout(this)
         homeTiles = FrameLayout(this)
+        expandLaunch = ExpandLaunchController(homeTiles, u)
         home.addView(homeTiles, FrameLayout.LayoutParams(-1, -1))
         val dockBottomMargin = px(12f)
         grid = FrameLayout(this).apply {
@@ -1145,6 +1194,13 @@ class MainActivity : Activity() {
             contentDescription = "Tiles Settings"
             setOnClickListener { openSettings(onboarding = false) }
         }
+        val collapseBtn = label("⌄", 24f, colors.text).apply {
+            gravity = Gravity.CENTER
+            contentDescription = "Hide keyboard"
+            visibility = View.GONE
+            setOnClickListener { hideKeyboard() }
+        }
+        collapseKbBtn = collapseBtn
         val searchRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -1156,6 +1212,7 @@ class MainActivity : Activity() {
             )
             addView(query, LinearLayout.LayoutParams(0, -1, 1f))
             addView(clearBtn, LinearLayout.LayoutParams(px(40f), -1))
+            addView(collapseBtn, LinearLayout.LayoutParams(px(40f), -1))
             addView(settingsIcon, LinearLayout.LayoutParams(px(46f), -1))
         }
         searchBarRow = searchRow
@@ -1165,7 +1222,17 @@ class MainActivity : Activity() {
             isVerticalScrollBarEnabled = false
             addView(drawerList, FrameLayout.LayoutParams(-1, -2))
         }
-        drawer.addView(drawerScroll, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = gap })
+        val listHolder = FrameLayout(this)
+        listHolder.addView(drawerScroll, FrameLayout.LayoutParams(-1, -1))
+        val slider = AlphabetSlider(this, u).apply {
+            ink = colors.text
+            accent = colors[TileTone.ACCENT].background
+            visibility = View.GONE
+            onLetter = { ch -> scrollDrawerToLetter(ch) }
+        }
+        alphabetSlider = slider
+        listHolder.addView(slider, FrameLayout.LayoutParams(px(110f), -1, Gravity.END))
+        drawer.addView(listHolder, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = gap })
         selectionBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -1207,6 +1274,16 @@ class MainActivity : Activity() {
             }
             override fun onDockConfigChanged() {
                 recomputeGridMetrics()
+                rebuildHome()
+            }
+            override fun onUsageTilingChanged(enabled: Boolean) {
+                if (enabled && !PermissionsHelper.isUsageAccessGranted(this@MainActivity)) {
+                    Toast.makeText(this@MainActivity,
+                        "Grant Usage Access to enable usage-based tiling. Your manual layout is used until then.",
+                        Toast.LENGTH_LONG).show()
+                    PermissionsHelper.openUsageAccessSettings(this@MainActivity)
+                }
+                if (enabled) UsageTiling.refreshIfStale(this@MainActivity) { if (!isDestroyed) rebuildHome() }
                 rebuildHome()
             }
             override fun onOpenBackgroundMenu() = backgroundMenu()
@@ -1302,7 +1379,7 @@ class MainActivity : Activity() {
     private fun span(sz: String): Pair<Int, Int> = TileSize.fromKey(sz).let { it.width to it.height }
 
     private fun layoutRequests(): List<HomeGrid.Request> = items.map {
-        val (width, height) = span(it.sz)
+        val (width, height) = span(it.effSz)
         HomeGrid.Request(it.column, width, height, it.fixedColumn, it.row)
     }
 
@@ -1325,19 +1402,12 @@ class MainActivity : Activity() {
         itemViews.clear()
         occupiedColumns = 0
         var rowsUsed = 0
-        val requests = layoutRequests()
         val itemPackages = List(items.size) { idx -> bindings.getOrNull(idx)?.packageName }
         val moveEnabled = launcherPrefs.notificationMoveEnabled && editItem == null && activeDrag == null
-        val moveResult = NotificationTileMover.computeDisplayPositions(
-            items = items,
-            requests = requests,
-            packageNames = itemPackages,
-            summaries = TileNotificationStore.allSummaries(),
-            columnsPerViewport = launcherPrefs.gridColumns,
-            enabled = moveEnabled
-        )
-        val positions = moveResult.positions
-        elevatedTileIndices = moveResult.elevatedIndices
+        val display = computeDisplayLayout(itemPackages, moveEnabled)
+        val requests = display.requests
+        val positions = display.positions
+        elevatedTileIndices = display.elevated
         for ((index, it) in items.withIndex()) {
             val (col, row) = positions[index]
             val request = requests[index]
@@ -1405,24 +1475,59 @@ class MainActivity : Activity() {
         }
     }
 
+    private class DisplayLayout(
+        val requests: List<HomeGrid.Request>,
+        val positions: List<HomeGrid.Position>,
+        val elevated: Set<Int>
+    )
+
+    /** True only when the toggle is on AND Usage Access is granted AND usage data has loaded. */
+    private fun usageActive(): Boolean = ::launcherPrefs.isInitialized && launcherPrefs.usageTilingEnabled &&
+        UsageTiling.hasData() && PermissionsHelper.isUsageAccessGranted(this)
+
+    /**
+     * Single source of truth for what Home shows: usage tiling (sizes + order) when active, otherwise the
+     * saved layout with optional notification elevation. Nothing here writes to saved tile data.
+     */
+    private fun computeDisplayLayout(packages: List<String?>, moveEnabled: Boolean): DisplayLayout {
+        val cols = launcherPrefs.gridColumns
+        val summaries = TileNotificationStore.allSummaries()
+        if (editItem == null && usageActive()) {
+            val elevated = if (moveEnabled) items.indices.filter { idx ->
+                (items[idx].type == "app" || items[idx].type == "slot") &&
+                    ((packages.getOrNull(idx)?.let { summaries[it]?.count } ?: 0) > 0)
+            }.toSet() else emptySet()
+            val result = UsageTiling.layout(items, packages, elevated, cols)
+            items.forEachIndexed { i, item -> item.displaySz = result.sizes[i]?.key }
+            return DisplayLayout(layoutRequests(), result.positions, result.elevated)
+        }
+        for (item in items) item.displaySz = null
+        val requests = layoutRequests()
+        val moved = NotificationTileMover.computeDisplayPositions(
+            items = items,
+            requests = requests,
+            packageNames = packages,
+            summaries = summaries,
+            columnsPerViewport = cols,
+            enabled = moveEnabled
+        )
+        return DisplayLayout(requests, moved.positions, moved.elevatedIndices)
+    }
+
     /** Smoothly animates tiles into/out of the notification priority zone without altering saved coordinates. */
     private fun onNotificationsChanged() {
         refreshNotificationBadges()
         if (!::launcherPrefs.isInitialized || !launcherPrefs.notificationMoveEnabled) return
         if (!resumed || editItem != null || activeDrag != null || folderOpen || items.isEmpty()) return
-        val requests = layoutRequests()
         val itemPackages = List(items.size) { idx -> homeComponents.getOrNull(idx)?.packageName }
-        val next = NotificationTileMover.computeDisplayPositions(
-            items = items,
-            requests = requests,
-            packageNames = itemPackages,
-            summaries = TileNotificationStore.allSummaries(),
-            columnsPerViewport = launcherPrefs.gridColumns,
-            enabled = true
-        )
+        val oldSizes = items.map { it.displaySz }
+        val next = computeDisplayLayout(itemPackages, true)
+        val requests = next.requests
         val positionsChanged = items.indices.any { idx -> placedPositions[items[idx]] != next.positions[idx] }
-        val elevationChanged = next.elevatedIndices != elevatedTileIndices
+        val elevationChanged = next.elevated != elevatedTileIndices
         if (!positionsChanged && !elevationChanged) return
+        // Tile sizes differ under usage tiling, so views must be rebuilt instead of just moved.
+        if (oldSizes != items.map { it.displaySz }) { rebuildHome(homeComponents); return }
 
         val transition = ChangeBounds().apply {
             duration = 320L
@@ -1433,7 +1538,7 @@ class MainActivity : Activity() {
 
         val step = tile + gap
         var rowsUsed = 0
-        elevatedTileIndices = next.elevatedIndices
+        elevatedTileIndices = next.elevated
         for ((idx, item) in items.withIndex()) {
             val pos = next.positions[idx]
             val req = requests[idx]
@@ -1478,19 +1583,15 @@ class MainActivity : Activity() {
         dock.visibility = View.VISIBLE
         val entries = dockManager.load(launcherPrefs.dockCount)
         val totalSlots = entries.size + if (showKb) 1 else 0
-        val innerPad = px(10f)
-        val dockGap = px(8f)
+        val innerPad = if (totalSlots > 6) px(4f) else px(8f)
+        val dockGap = if (totalSlots > 6) px(4f) else px(8f)
         val availW = (pageWidth() - px(24f) - innerPad * 2 - dockGap * (totalSlots - 1)).coerceAtLeast(1)
-        val iconSize = min(min(tile, px(64f)), availW / totalSlots.coerceAtLeast(1)).coerceAtLeast(px(40f))
+        val iconSize = min(min(tile, px(64f)), availW / totalSlots.coerceAtLeast(1)).coerceAtLeast(px(26f))
         val dockHeight = iconSize + innerPad * 2
 
-        dock.background = BlurEffects.glassBackground(
-            baseColor = colors.panel,
-            blurIntensity = blurIntensity(),
-            cornerRadiusPx = px(22f).toFloat(),
-            isDark = colors.isDark
-        )
-        dock.clipToOutline = true
+        // Clean dock container without any box outline/border
+        dock.background = null
+        dock.clipToOutline = false
         dock.layoutParams = (dock.layoutParams as FrameLayout.LayoutParams).apply {
             height = dockHeight
             leftMargin = px(12f)
@@ -1510,6 +1611,7 @@ class MainActivity : Activity() {
             val app = if (slot != null) resolve(slot) else apps.firstOrNull { it.component.flattenToString() == entry.key }
             val (face, background) = appFace(app, false, slot)
             val host = tileHost(face, background)
+            host.draggableItem = Item("dock", i.toString(), "s", -1)
             bindNotificationBadge(host, app?.component)
             host.setOnClickListener {
                 if (app != null) launch(host, app)
@@ -1517,7 +1619,7 @@ class MainActivity : Activity() {
                 else pickDockApp(i)
             }
             host.setOnLongClickListener { dockEntryMenu(i, entries.size, app, slot); true }
-            // Drag-and-drop a tile from the Home grid onto a dock slot to pin it there
+            // Drag-and-drop into dock or reorder within dock
             host.setOnDragListener { v, event ->
                 val drag = event.localState as? TileDrag ?: return@setOnDragListener false
                 when (event.action) {
@@ -1525,15 +1627,23 @@ class MainActivity : Activity() {
                     DragEvent.ACTION_DRAG_EXITED, DragEvent.ACTION_DRAG_ENDED -> { v.scaleX = 1f; v.scaleY = 1f }
                     DragEvent.ACTION_DROP -> {
                         v.scaleX = 1f; v.scaleY = 1f
-                        val draggedApp = when (drag.item.type) {
-                            "app" -> appFor(drag.item)
-                            "slot" -> slots[drag.item.key]?.let { resolve(it) }
-                            else -> null
-                        }
-                        if (draggedApp != null) {
-                            dockManager.setAppAt(i, draggedApp.component.flattenToString())
-                            v.post { rebuildHome() }
-                            Toast.makeText(this, "Pinned ${draggedApp.label} to dock", Toast.LENGTH_SHORT).show()
+                        if (drag.item.type == "dock") {
+                            val fromIdx = drag.item.key.toIntOrNull() ?: -1
+                            if (fromIdx >= 0 && fromIdx != i) {
+                                dockManager.swap(fromIdx, i)
+                                v.post { rebuildHome() }
+                            }
+                        } else {
+                            val draggedApp = when (drag.item.type) {
+                                "app" -> appFor(drag.item)
+                                "slot" -> slots[drag.item.key]?.let { resolve(it) }
+                                else -> null
+                            }
+                            if (draggedApp != null) {
+                                dockManager.setAppAt(i, draggedApp.component.flattenToString())
+                                v.post { rebuildHome() }
+                                Toast.makeText(this, "Pinned ${draggedApp.label} to dock", Toast.LENGTH_SHORT).show()
+                            }
                         }
                     }
                 }
@@ -1697,7 +1807,7 @@ class MainActivity : Activity() {
                 val s = slots[it.key] ?: wxSlot
                 val app = resolve(s)
                 val over = styleOverride(it)
-                val (sw, sh) = span(it.sz)
+                val (sw, sh) = span(it.effSz)
                 if (sw >= 2 && sh >= 2) {
                     return largeAppTile(it, app, s, over ?: appTileColors(app, s))
                 }
@@ -1735,7 +1845,7 @@ class MainActivity : Activity() {
             else -> {
                 val app = apps.firstOrNull { a -> a.component.flattenToString() == it.key }
                 val over = styleOverride(it)
-                val (sw, sh) = span(it.sz)
+                val (sw, sh) = span(it.effSz)
                 if (app != null && sw >= 2 && sh >= 2) {
                     return largeAppTile(it, app, null, over ?: appTileColors(app))
                 }
@@ -2046,7 +2156,7 @@ class MainActivity : Activity() {
             }))
         } else if (app != null) {
             addTileActionRow(content, tileColors, listOf(entry("Open") { launch(host, app) }))
-            for (shortcut in shortcuts.take(if (span(item.sz).second >= 4) 4 else 1)) {
+            for (shortcut in shortcuts.take(if (span(item.effSz).second >= 4) 4 else 1)) {
                 val actionName = shortcut.shortLabel?.toString() ?: continue
                 addTileActionRow(content, tileColors, listOf(entry(actionName) {
                     runTileLaunch(host) { startTileShortcut(shortcut) }
@@ -2139,7 +2249,7 @@ class MainActivity : Activity() {
 
     private fun folderTile(item: Item, folder: LiveFolder): TileHost {
         val accent = tileColors(TileTone.ACCENT)
-        val (sw, sh) = span(item.sz)
+        val (sw, sh) = span(item.effSz)
         val isLargeFolder = sw >= 2 && sh >= 2
         val positions = HomeGrid.pack(folderRequests(folder))
         val preview = folder.apps.zip(positions)
@@ -2264,7 +2374,7 @@ class MainActivity : Activity() {
     }
 
     private fun folderRequests(folder: LiveFolder): List<HomeGrid.Request> = folder.apps.map {
-        val (width, height) = span(it.sz)
+        val (width, height) = span(it.effSz)
         val clamped = width.coerceAtMost(4)
         HomeGrid.Request(if (!it.fixedColumn && it.row == null) 0 else it.column.coerceIn(0, 4 - clamped),
             clamped, height, it.fixedColumn, it.row)
@@ -2424,7 +2534,8 @@ class MainActivity : Activity() {
         askFolderName { name ->
             val folder = LiveFolder(UUID.randomUUID().toString(), name)
             folders[folder.id] = folder
-            val item = Item("folder", folder.id, "m", -1, column)
+            val end = anchorAndFindEnd(2, 2)
+            val item = Item("folder", folder.id, "m", -1, end.column, true, end.row)
             items.add(item)
             if (members.isEmpty()) updateFolders() else addFolderApps(folder, members)
             revealTile(item)
@@ -2527,7 +2638,38 @@ class MainActivity : Activity() {
             rows.add(Pair(app, row))
             if (app.component.flattenToString() in selectedApps) showSelected(row, true)
         }
+        alphabetSlider?.available = rows.map { letterFor(it.first.label) }.toSet()
         filter()
+    }
+
+    private fun letterFor(label: String): Char {
+        val c = label.trim().firstOrNull()?.uppercaseChar() ?: return '#'
+        return if (c in 'A'..'Z') c else '#'
+    }
+
+    /** Jumps the All Apps list to the first app at or after [letter]. Uses current (unfiltered) order. */
+    private fun scrollDrawerToLetter(letter: Char) {
+        val visible = rows.filter { it.second.visibility == View.VISIBLE }
+        val target = visible.firstOrNull { letterFor(it.first.label) == letter }
+            ?: if (letter == '#') null else visible.firstOrNull {
+                val l = letterFor(it.first.label)
+                l != '#' && l > letter
+            } ?: visible.lastOrNull()
+        target?.let { drawerScroll.scrollTo(0, it.second.top) }
+    }
+
+    private fun updateSliderVisibility() {
+        val slider = alphabetSlider ?: return
+        val show = ::launcherPrefs.isInitialized && launcherPrefs.alphabetSliderEnabled && query.text.isNullOrEmpty()
+        slider.visibility = if (show) View.VISIBLE else View.GONE
+        drawerList.setPadding(0, 0, if (show) px(28f) else 0, 0)
+    }
+
+    /** The collapse button only makes sense while All Apps is open and the keyboard is up. */
+    private fun updateCollapseButton() {
+        val btn = collapseKbBtn ?: return
+        val keyboardUp = if (Build.VERSION.SDK_INT >= 30) imeVisible else query.hasFocus()
+        btn.visibility = if (drawerOpen && keyboardUp) View.VISIBLE else View.GONE
     }
 
     private fun multiActive() = multiPick != null || generalSelect
@@ -2612,6 +2754,7 @@ class MainActivity : Activity() {
 
     private fun filter() {
         val q = query.text.toString().trim()
+        updateSliderVisibility()
         if (q.isEmpty()) {
             if (drawerFiltered) {
                 drawerList.removeAllViews()
@@ -2649,6 +2792,7 @@ class MainActivity : Activity() {
         drawerOpen = true
         query.hint = hint ?: "search apps · T9 / fuzzy"
         query.setText("")
+        updateSliderVisibility()
         drawer.animate().cancel()
         if (drawer.visibility != View.VISIBLE) drawer.translationY = root.height.toFloat()
         drawer.visibility = View.VISIBLE
@@ -2674,6 +2818,7 @@ class MainActivity : Activity() {
             }
             val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
             imm.showSoftInput(query, InputMethodManager.SHOW_IMPLICIT)
+            updateCollapseButton()
         }
     }
 
@@ -2691,6 +2836,7 @@ class MainActivity : Activity() {
         clearSelection()
         updateSelectionBar()
         hideKeyboard()
+        updateCollapseButton()
         updateOverlayBlur()
         drawer.animate().cancel()
         if (immediate) {
@@ -2709,6 +2855,7 @@ class MainActivity : Activity() {
         (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(query.windowToken, 0)
         query.clearFocus()
         if (drawer.visibility == View.VISIBLE) drawer.requestFocus()
+        updateCollapseButton()
     }
 
     private fun pickFor(s: Slot) {
@@ -2769,37 +2916,12 @@ class MainActivity : Activity() {
 
     private fun entry(name: String, f: () -> Unit): Pair<String, () -> Unit> = Pair(name, f)
 
+    /** Long-press on empty Home space: exactly three actions. Everything else lives in Launcher Settings. */
     private fun homeMenu() {
-        val rounded = launcherPrefs.tileCornerRadiusDp > 0
-        val colorSummary = when {
-            solidTiles != null -> "solid"
-            launcherPrefs.materialYouEnabled -> "Material You"
-            else -> launcherTheme.label
-        }
         menu("home", listOf(
-            entry("launcher settings") { openSettings(onboarding = false) },
-            entry("permissions & setup") { openSettings(onboarding = true) },
-            entry("all apps") { openDrawer(null, null) },
-            entry("add apps here") { addApps(currentColumn(), fixed = false) },
-            entry("add apps to the right") {
-                addApps(occupiedColumns.coerceAtMost(MAX_TILE_COLUMN), fixed = true)
-            },
-            entry("create folder") { createFolder(currentColumn()) },
-            entry("add widget") { addWidget() },
-            entry("export layout") { selectLayoutFile(export = true) },
-            entry("import layout") { selectLayoutFile(export = false) },
-            entry("colors: $colorSummary") { colorMenu() },
-            entry(if (customTiles) "custom tile style: on (move/resize off)" else "custom tile style: off") { toggleCustomTiles() },
-            entry(if (rounded) "tile corners: rounded (${launcherPrefs.tileCornerRadiusDp}dp)" else "tile corners: square") {
-                launcherPrefs.tileCornerRadiusDp = if (rounded) 0 else 16
-                rebuildHome()
-                rebuildDrawer()
-            },
-            entry("motion") { motionMenu() },
-            entry("reset layout") {
-                for (it in items) if (it.type == "widget" && it.wid >= 0) widgetHost.deleteAppWidgetId(it.wid)
-                prefs.edit().remove("items").apply(); loadItems(); rebuildHome()
-            }
+            entry("Create Folder") { createFolder(currentColumn()) },
+            entry("Add Widget") { addWidget() },
+            entry("Launcher Settings") { openSettings(onboarding = false) }
         ))
     }
 
@@ -2818,6 +2940,7 @@ class MainActivity : Activity() {
         val styleLabel = when (style) {
             LauncherPrefs.LAUNCH_MORPH -> "morph (spring)"
             LauncherPrefs.LAUNCH_TURN -> "tile turn"
+            LauncherPrefs.LAUNCH_EXPAND -> "slow expand + dock return"
             LauncherPrefs.LAUNCH_SLIDE -> "slide"
             else -> "none"
         }
@@ -2834,7 +2957,8 @@ class MainActivity : Activity() {
             entry("open app: $styleLabel") {
                 launcherPrefs.launchStyle = when (style) {
                     LauncherPrefs.LAUNCH_MORPH -> LauncherPrefs.LAUNCH_TURN
-                    LauncherPrefs.LAUNCH_TURN -> LauncherPrefs.LAUNCH_SLIDE
+                    LauncherPrefs.LAUNCH_TURN -> LauncherPrefs.LAUNCH_EXPAND
+                    LauncherPrefs.LAUNCH_EXPAND -> LauncherPrefs.LAUNCH_SLIDE
                     LauncherPrefs.LAUNCH_SLIDE -> LauncherPrefs.LAUNCH_NONE
                     else -> LauncherPrefs.LAUNCH_MORPH
                 }
@@ -3179,6 +3303,12 @@ class MainActivity : Activity() {
         selectionBar.setBackgroundColor(colors.panel)
         query.setTextColor(colors.text)
         query.setHintTextColor(colors.mutedText)
+        collapseKbBtn?.setTextColor(colors.text)
+        alphabetSlider?.apply {
+            ink = colors.text
+            accent = colors[TileTone.ACCENT].background
+            invalidate()
+        }
         searchBarRow?.background = BlurEffects.glassBackground(
             baseColor = colors[TileTone.CHARCOAL].background,
             blurIntensity = blurIntensity(),
@@ -3216,13 +3346,45 @@ class MainActivity : Activity() {
     private fun pinApp(app: App, column: Int, fixed: Boolean = false) = pinApps(listOf(app), column, fixed)
 
     private fun pinApps(list: List<App>, column: Int, fixed: Boolean = false) {
-        list.forEachIndexed { index, app ->
-            // Fixed placements fan out over four columns so a batch lands as a block.
-            val col = if (fixed) (column + index % HomeGrid.COLUMNS_PER_VIEWPORT).coerceAtMost(MAX_TILE_COLUMN) else column
-            items.add(Item("app", app.component.flattenToString(), "s", -1, col, fixed))
+        // New apps always go to the END of the layout; existing tiles keep their exact cells.
+        var lastAdded: Item? = null
+        for (app in list) {
+            val end = anchorAndFindEnd(1, 1)
+            val item = Item("app", app.component.flattenToString(), "s", -1, end.column, true, end.row)
+            items.add(item)
+            lastAdded = item
         }
         saveItems()
         rebuildHome()
+        lastAdded?.let { revealTile(it) }
+    }
+
+    /**
+     * Pins every existing tile at its current packed cell (so adding never reshuffles anything), then
+     * returns the first free cell that comes after the last tile in row-major order.
+     */
+    private fun anchorAndFindEnd(width: Int, height: Int): HomeGrid.Position {
+        val cols = launcherPrefs.gridColumns
+        val requests = items.map {
+            val size = TileSize.fromKey(it.sz)
+            HomeGrid.Request(it.column, size.width, size.height, it.fixedColumn, it.row)
+        }
+        val packed = HomeGrid.pack(requests, cols)
+        applyPositions(packed)
+        if (items.isEmpty()) return HomeGrid.Position(0, 0)
+        val w = width.coerceIn(1, cols)
+        val last = items.indices.maxWithOrNull(compareBy({ packed[it].row }, { packed[it].column }))!!
+        var row = packed[last].row
+        var col = packed[last].column + requests[last].width
+        while (true) {
+            if (col + w > cols) { row++; col = 0 }
+            val free = items.indices.none { i ->
+                col < packed[i].column + requests[i].width && col + w > packed[i].column &&
+                    row < packed[i].row + requests[i].height && row + height > packed[i].row
+            }
+            if (free) return HomeGrid.Position(col, row)
+            col++
+        }
     }
 
     private fun applyPositions(positions: List<HomeGrid.Position>) {
@@ -3238,7 +3400,7 @@ class MainActivity : Activity() {
             override fun onPreDraw(): Boolean {
                 grid.viewTreeObserver.removeOnPreDrawListener(this)
                 val position = placedPositions[item] ?: return true
-                val (width, height) = span(item.sz)
+                val (width, height) = span(item.effSz)
                 val left = px(12f) + position.column * (tile + gap)
                 val top = px(10f) + position.row * (tile + gap)
                 val right = left + width * (tile + gap) - gap
@@ -3312,7 +3474,7 @@ class MainActivity : Activity() {
             })
             if (fromDrawer && onPick == null && !multiActive()) e.add(entry("select multiple") { startGeneralSelect(app) })
         }
-        if (it != null && !customTiles) {
+        if (it != null && !customTiles && !usageActive()) {
             if (canResize(it) && it.type in setOf("slot", "app")) {
                 val curSize = TileSize.fromKey(it.sz)
                 val isLarge = curSize.width >= 2 || curSize.height >= 2
@@ -3411,7 +3573,7 @@ class MainActivity : Activity() {
             target.minimumHeight = oldMinHeight
         }
         fun incoming(item: Item): HomeGrid.Request {
-            val size = span(item.sz)
+            val size = span(item.effSz)
             return HomeGrid.Request(0, size.first.coerceAtMost(4), size.second, true, 0)
         }
         fun preview(drag: TileDrag, x: Float, y: Float): HomeGrid.Position {
@@ -3614,6 +3776,27 @@ class MainActivity : Activity() {
         }
         target.setOnDragListener { _, event ->
             val drag = event.localState as? TileDrag ?: return@setOnDragListener false
+            if (drag.item.type == "dock" && target === grid) {
+                when (event.action) {
+                    DragEvent.ACTION_DROP -> {
+                        val dockIdx = drag.item.key.toIntOrNull() ?: -1
+                        val entry = dockManager.load(launcherPrefs.dockCount).getOrNull(dockIdx)
+                        val dockApp = if (entry == null) null
+                            else if (entry.type == "slot") slots[entry.key]?.let { resolve(it) }
+                            else apps.firstOrNull { it.component.flattenToString() == entry.key }
+                        if (dockApp != null) {
+                            target.post { pinApp(dockApp, 0) }
+                        }
+                    }
+                    DragEvent.ACTION_DRAG_ENDED -> {
+                        drag.host.alpha = 1f
+                        activeDrag = null
+                        touching = false
+                        if (resumed) startLive()
+                    }
+                }
+                return@setOnDragListener true
+            }
             if (drag.grid !== target) return@setOnDragListener false
             target.removeCallbacks(edgeScroll)
             when (event.action) {
@@ -3686,8 +3869,8 @@ class MainActivity : Activity() {
 
     private fun startTileDrag(host: FrameLayout, item: Item): Boolean {
         val tile = host as? TileHost ?: return false
-        if (customTiles) return false
-        val parent = tile.parent as? FrameLayout ?: return false
+        if (customTiles || usageActive()) return false
+        val parent = (tile.parent as? FrameLayout) ?: if (item.type == "dock") dock else return false
         if (!tile.isShown || activeDrag != null) return false
         stopLive()
         clearHomeMotion()
@@ -3696,7 +3879,8 @@ class MainActivity : Activity() {
         tile.rotationX = 0f
         tile.scaleX = 1f
         tile.scaleY = 1f
-        val hosts = (0 until parent.childCount).mapNotNull { parent.getChildAt(it) as? TileHost }
+        val hosts = if (item.type == "dock") listOf(tile)
+        else (0 until parent.childCount).mapNotNull { parent.getChildAt(it) as? TileHost }
             .filter { it.draggableItem != null }
         val loc = IntArray(2)
         tile.getLocationOnScreen(loc)
@@ -4062,7 +4246,18 @@ class MainActivity : Activity() {
 
     private fun flipOnLaunch() = ::launcherPrefs.isInitialized && launcherPrefs.launchStyle == LauncherPrefs.LAUNCH_TURN
 
-    private fun launch(host: TileHost, app: App) = runTileLaunch(host) { openMainApp(app, host) }
+    private fun buildReturnCopyTile(app: App?): TileHost {
+        val (face, bg) = appFace(app, true)
+        val copy = tileHost(face, bg)
+        bindNotificationBadge(copy, app?.component)
+        copy.setOnClickListener { if (app != null) launch(copy, app) }
+        return copy
+    }
+
+    private fun launch(host: TileHost, app: App) {
+        expandApp = app
+        runTileLaunch(host) { openMainApp(app, host) }
+    }
 
     private fun openMainApp(app: App, sourceHost: View? = null) {
         closeMenu()
@@ -4085,6 +4280,7 @@ class MainActivity : Activity() {
         } catch (e: Exception) {
             clearHomeMotion()
             resetFlyingTiles()
+            if (::expandLaunch.isInitialized) expandLaunch.cancelExpand()
             Toast.makeText(this, "Unable to open ${app.label}", Toast.LENGTH_SHORT).show()
         }
     }
@@ -4092,6 +4288,17 @@ class MainActivity : Activity() {
     private fun runTileLaunch(host: TileHost, open: () -> Unit) {
         if (!resumed || !hasWindowFocus() || !host.isShown || launchAnimator != null) return
         val style = if (::launcherPrefs.isInitialized) launcherPrefs.launchStyle else LauncherPrefs.LAUNCH_MORPH
+        if (style == LauncherPrefs.LAUNCH_EXPAND) {
+            clearHomeMotion()
+            stopIconMotion()
+            if (!drawerOpen && ::expandLaunch.isInitialized) {
+                val expandMs = max(540L, launcherPrefs.launchSpeedMs * 2L)
+                expandLaunch.startExpand(host, expandMs)
+            }
+            // Start launching immediately in the background while the tile is expanding
+            openDirectly(open)
+            return
+        }
         if (style == LauncherPrefs.LAUNCH_MORPH) {
             if (ValueAnimator.areAnimatorsEnabled()) {
                 LaunchTransitionHelper.pulseMorphSource(host, launcherPrefs.launchSpeedMs)
@@ -4183,7 +4390,8 @@ class MainActivity : Activity() {
 
     private fun shouldSkipAppTransition(): Boolean {
         val style = if (::launcherPrefs.isInitialized) launcherPrefs.launchStyle else LauncherPrefs.LAUNCH_MORPH
-        return directAppHandoff || style == LauncherPrefs.LAUNCH_TURN || style == LauncherPrefs.LAUNCH_NONE
+        return directAppHandoff || style == LauncherPrefs.LAUNCH_TURN ||
+            style == LauncherPrefs.LAUNCH_NONE || style == LauncherPrefs.LAUNCH_EXPAND
     }
 
     private fun withLaunchFlags(intent: Intent): Intent {
