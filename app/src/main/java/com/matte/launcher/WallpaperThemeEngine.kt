@@ -144,7 +144,10 @@ internal object WallpaperThemeEngine {
                 if ((which and WallpaperManager.FLAG_SYSTEM) != 0) onChanged()
             }
             wm.addOnColorsChangedListener(listener, Handler(Looper.getMainLooper()))
-            { try { wm.removeOnColorsChangedListener(listener) } catch (_: Exception) {} }
+            val unregister: () -> Unit = {
+                try { wm.removeOnColorsChangedListener(listener) } catch (_: Exception) {}
+            }
+            unregister
         } catch (_: Exception) {
             {}
         }

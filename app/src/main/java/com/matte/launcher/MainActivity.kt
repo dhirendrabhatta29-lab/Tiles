@@ -1389,11 +1389,12 @@ class MainActivity : Activity() {
         host.elevation = u * 6f
         if (existing == null) {
             val dotSize = px(9f).coerceAtLeast(6)
+            val signalBg = colors[TileTone.SIGNAL].background
             val dot = View(this).apply {
                 tag = "notif-elevated-dot"
                 background = GradientDrawable().apply {
                     shape = GradientDrawable.OVAL
-                    setColor(colors[TileTone.SIGNAL].background)
+                    setColor(signalBg)
                     setStroke(max(1, px(1.5f)), Color.WHITE)
                 }
             }
@@ -2638,7 +2639,9 @@ class MainActivity : Activity() {
         drawerScroll.scrollTo(0, 0)
     }
 
-    private fun openDrawer(hint: String?, pick: ((App) -> Unit)?, focusKeyboard: Boolean = false) {
+    private fun openDrawer(hint: String?, pick: ((App) -> Unit)?) = openDrawer(hint, pick, false)
+
+    private fun openDrawer(hint: String?, pick: ((App) -> Unit)?, focusKeyboard: Boolean) {
         onPick = pick
         multiPick = null
         generalSelect = false
