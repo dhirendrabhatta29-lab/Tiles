@@ -339,6 +339,17 @@ class MainActivity : Activity() {
     private data class HomeBadge(val packageName: String, val label: TextView, val face: TileView?)
     private val homeBadges = ArrayList<HomeBadge>()
     private val notificationObserver: () -> Unit = { refreshNotificationBadges() }
+    private val summaryObserver: () -> Unit = { onNotificationsChanged() }
+    private val mediaObserver: () -> Unit = { scheduleMediaRefresh() }
+    private lateinit var liveContentHub: LiveContentHub
+    private val itemViews = HashMap<Item, View>()
+    private var elevatedTileIndices: Set<Int> = emptySet()
+    private val refreshMediaRunnable = Runnable {
+        if (resumed && ::launcherPrefs.isInitialized && launcherPrefs.dynamicTilesEnabled &&
+            !folderOpen && editItem == null && activeDrag == null) {
+            rebuildHome()
+        }
+    }
     private var homeAnimator: ValueAnimator? = null
     private var launchAnimator: ValueAnimator? = null
     private val swayingTiles = LinkedHashSet<TileHost>()
@@ -505,6 +516,12 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         launcherPrefs = LauncherPrefs(prefs)
         dockManager = DockManager(prefs)
+        liveContentHub = LiveContentHub(this, prefs) { runOnUiThread { if (!isDestroyed) applyData() } }
+        liveContentHub.loadCachedWeather()?.let { cached ->
+            wxTemp = cached.temp
+            wxDesc = cached.desc
+            wxHL = cached.hiLo
+        }
         if (prefs.contains("home_background")) customBackground = prefs.getInt("home_background", LauncherTheme.MATTE.colors.background)
         useWallpaper = launcherPrefs.useWallpaper
         customTiles = prefs.getBoolean("custom_tiles", false)
@@ -570,7 +587,10 @@ class MainActivity : Activity() {
     override fun onStart() {
         super.onStart()
         started = true
+        liveContentHub.start()
         TileNotificationCounts.observe(notificationObserver)
+        TileNotificationStore.observeSummaries(summaryObserver)
+        TileNotificationStore.observeMedia(mediaObserver)
         refreshNotificationBadges()
         root.invalidate()
         try { widgetHost.startListening() } catch (e: Exception) { }
@@ -620,7 +640,11 @@ class MainActivity : Activity() {
     override fun onStop() {
         super.onStop()
         started = false
+        handler.removeCallbacks(refreshMediaRunnable)
+        liveContentHub.stop()
         TileNotificationCounts.remove(notificationObserver)
+        TileNotificationStore.removeSummaryObserver(summaryObserver)
+        TileNotificationStore.removeMediaObserver(mediaObserver)
         needsEntrance = true
         clearHomeMotion()
         cancelLaunchMotion()
@@ -1243,10 +1267,22 @@ class MainActivity : Activity() {
         val step = tile + gap
         alarmLabels.clear()
         placedPositions.clear()
+        itemViews.clear()
         occupiedColumns = 0
         var rowsUsed = 0
         val requests = layoutRequests()
-        val positions = HomeGrid.pack(requests, launcherPrefs.gridColumns)
+        val itemPackages = List(items.size) { idx -> bindings.getOrNull(idx)?.packageName }
+        val moveEnabled = launcherPrefs.notificationMoveEnabled && editItem == null && activeDrag == null
+        val moveResult = NotificationTileMover.computeDisplayPositions(
+            items = items,
+            requests = requests,
+            packageNames = itemPackages,
+            summaries = TileNotificationStore.allSummaries(),
+            columnsPerViewport = launcherPrefs.gridColumns,
+            enabled = moveEnabled
+        )
+        val positions = moveResult.positions
+        elevatedTileIndices = moveResult.elevatedIndices
         for ((index, it) in items.withIndex()) {
             val (col, row) = positions[index]
             val request = requests[index]
@@ -1256,10 +1292,12 @@ class MainActivity : Activity() {
             val w = request.width * step - gap
             val h = request.height * step - gap
             val v = itemView(it, w, h)
+            itemViews[it] = v
             (v as? TileHost)?.draggableItem = it
             if (v is TileHost) applyTileImage(v, it)
             v.transitionName = it.transitionName
             if (v is TileHost && it.type != "widget") bindNotificationBadge(v, bindings.getOrNull(index))
+            if (v is TileHost) applyElevatedIndicator(v, index in elevatedTileIndices)
             if (editItem != null) editDecor(v, it)
             grid.addView(v, FrameLayout.LayoutParams(w, h).apply {
                 leftMargin = px(12f) + col * step
@@ -1278,6 +1316,82 @@ class MainActivity : Activity() {
         refreshAlarmLabels()
         refreshNotificationBadges()
         if (resumed && hasWindowFocus()) startLive()
+    }
+
+    private fun scheduleMediaRefresh() {
+        handler.removeCallbacks(refreshMediaRunnable)
+        handler.postDelayed(refreshMediaRunnable, 180L)
+    }
+
+    /** Visual priority highlight dot + subtle lift shown on notification-elevated tiles. */
+    private fun applyElevatedIndicator(host: TileHost, elevated: Boolean) {
+        val existing = host.findViewWithTag<View>("notif-elevated-dot")
+        if (!elevated) {
+            if (existing != null) host.removeView(existing)
+            host.elevation = 0f
+            return
+        }
+        host.elevation = u * 6f
+        if (existing == null) {
+            val dotSize = px(9f).coerceAtLeast(6)
+            val dot = View(this).apply {
+                tag = "notif-elevated-dot"
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(colors[TileTone.SIGNAL].background)
+                    setStroke(max(1, px(1.5f)), Color.WHITE)
+                }
+            }
+            host.addView(dot, FrameLayout.LayoutParams(dotSize, dotSize, Gravity.TOP or Gravity.END).apply {
+                topMargin = px(7f)
+                rightMargin = px(7f)
+            })
+        }
+    }
+
+    /** Smoothly animates tiles into/out of the notification priority zone without altering saved coordinates. */
+    private fun onNotificationsChanged() {
+        refreshNotificationBadges()
+        if (!::launcherPrefs.isInitialized || !launcherPrefs.notificationMoveEnabled) return
+        if (!resumed || editItem != null || activeDrag != null || folderOpen || items.isEmpty()) return
+        val requests = layoutRequests()
+        val itemPackages = List(items.size) { idx -> homeComponents.getOrNull(idx)?.packageName }
+        val next = NotificationTileMover.computeDisplayPositions(
+            items = items,
+            requests = requests,
+            packageNames = itemPackages,
+            summaries = TileNotificationStore.allSummaries(),
+            columnsPerViewport = launcherPrefs.gridColumns,
+            enabled = true
+        )
+        val positionsChanged = items.indices.any { idx -> placedPositions[items[idx]] != next.positions[idx] }
+        val elevationChanged = next.elevatedIndices != elevatedTileIndices
+        if (!positionsChanged && !elevationChanged) return
+
+        val transition = ChangeBounds().apply {
+            duration = 320L
+            interpolator = DecelerateInterpolator(1.8f)
+            for (item in items) addTarget(item.transitionName)
+        }
+        TransitionManager.beginDelayedTransition(grid, transition)
+
+        val step = tile + gap
+        var rowsUsed = 0
+        elevatedTileIndices = next.elevatedIndices
+        for ((idx, item) in items.withIndex()) {
+            val pos = next.positions[idx]
+            val req = requests[idx]
+            placedPositions[item] = pos
+            rowsUsed = max(rowsUsed, pos.row + req.height)
+            val view = itemViews[item] ?: continue
+            val lp = view.layoutParams as? FrameLayout.LayoutParams ?: continue
+            lp.leftMargin = px(12f) + pos.column * step
+            lp.topMargin = px(10f) + pos.row * step
+            view.layoutParams = lp
+            if (view is TileHost) applyElevatedIndicator(view, idx in elevatedTileIndices)
+        }
+        grid.minimumHeight = px(10f) + rowsUsed * step + px(4f)
+        grid.requestLayout()
     }
 
     private fun rebuildDockUi() {
@@ -1515,8 +1629,8 @@ class MainActivity : Activity() {
                 val app = resolve(wxSlot)
                 val host = tileHost(face, tileColors.background)
                 host.setOnClickListener {
-                    if (checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED)
-                        requestPermissions(arrayOf(Manifest.permission.ACCESS_COARSE_LOCATION), 1)
+                    if (!PermissionsHelper.isLocationGranted(this))
+                        PermissionsHelper.request(this, PermissionsHelper.Kind.LOCATION)
                     else if (app != null) launch(host, app)
                     else safeStart(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=weather")))
                 }
@@ -1684,16 +1798,34 @@ class MainActivity : Activity() {
         if (folderOpen) rebuildFolderPages()
     }
 
-    /** OxygenOS-style 2x1 wide card with icon, title, contextual subtitle, and quick action pill. */
+    /** OxygenOS-style 2x1 wide card with icon, title, live contextual subtitle (media/notif/battery), and quick action pill. */
     private fun wideAppTile(item: Item, app: App?, slot: Slot?, tileColors: TileColors): TileHost {
-        val iconFace = appFace(app, false, slot, colorsOverride = tileColors).first.apply {
-            setBackgroundColor(Color.TRANSPARENT)
+        val pkg = app?.component?.packageName
+        val dynamicOn = ::launcherPrefs.isInitialized && launcherPrefs.dynamicTilesEnabled
+        val liveMedia = if (dynamicOn) TileNotificationStore.liveMedia() else null
+        val isMediaTile = liveMedia != null &&
+            (slot?.id == "music" || pkg == liveMedia.packageName)
+
+        val iconView: View = if (isMediaTile && liveMedia?.albumArt != null) {
+            ImageView(this).apply {
+                setImageBitmap(liveMedia.albumArt)
+                scaleType = ImageView.ScaleType.CENTER_CROP
+            }
+        } else {
+            appFace(app, false, slot, colorsOverride = tileColors).first.apply {
+                setBackgroundColor(Color.TRANSPARENT)
+            }
         }
-        val title = app?.label ?: slot?.label ?: "App"
+        val title = if (isMediaTile && liveMedia != null) liveMedia.title else (app?.label ?: slot?.label ?: "App")
         val shortcuts = if (app != null) shortcutsFor(app).filter { it.isEnabled } else emptyList()
         val firstSc = shortcuts.firstOrNull()
         val hostRef = arrayOfNulls<TileHost>(1)
+        val notifPreview = if (dynamicOn && pkg != null) TileNotificationStore.summary(pkg)?.previewLine() else null
+
         val quickAction = when {
+            isMediaTile && liveMedia != null -> LargeTileRenderer.Action(if (liveMedia.isPlaying) "Pause" else "Play") {
+                TileNotificationStore.togglePlayPause()
+            }
             slot?.id == "settings" -> LargeTileRenderer.Action("Tiles") { openSettings(onboarding = false) }
             firstSc != null -> LargeTileRenderer.Action((firstSc.shortLabel ?: "Action").toString()) {
                 hostRef[0]?.let { h -> runTileLaunch(h) { startTileShortcut(firstSc) } }
@@ -1704,11 +1836,15 @@ class MainActivity : Activity() {
             slot != null -> LargeTileRenderer.Action("Pick") { pickFor(slot) }
             else -> null
         }
-        val subtitle = LargeTileRenderer.wideSubtitle(app, shortcuts, null)
-        val card = LargeTileRenderer.buildWideCard(this, u, iconFace, title, subtitle, tileColors, quickAction)
+        val subtitle = when {
+            isMediaTile && liveMedia != null -> "${if (liveMedia.isPlaying) "Playing" else "Paused"} · ${liveMedia.artist}"
+            dynamicOn && slot?.id == "settings" -> "Battery ${liveContentHub.battery.shortLabel()} · Tiles Settings"
+            else -> LargeTileRenderer.wideSubtitle(app, shortcuts, notifPreview)
+        }
+        val card = LargeTileRenderer.buildWideCard(this, u, iconView, title, subtitle, tileColors, quickAction)
         val host = tileHost(card, tileColors.background)
         hostRef[0] = host
-        host.liveHeader = iconFace
+        host.liveHeader = iconView
         host.setOnClickListener {
             if (app != null) launch(host, app) else if (slot != null) pickFor(slot)
         }
@@ -1765,6 +1901,56 @@ class MainActivity : Activity() {
             return host
         }
 
+        val dynamicOn = ::launcherPrefs.isInitialized && launcherPrefs.dynamicTilesEnabled
+        val liveMedia = if (dynamicOn) TileNotificationStore.liveMedia() else null
+        if (liveMedia != null && (slot?.id == "music" || packageName == liveMedia.packageName)) {
+            val mediaHeader = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            if (liveMedia.albumArt != null) {
+                val artView = ImageView(this).apply {
+                    setImageBitmap(liveMedia.albumArt)
+                    scaleType = ImageView.ScaleType.CENTER_CROP
+                    background = GradientDrawable().apply { cornerRadius = px(8f).toFloat() }
+                    clipToOutline = true
+                }
+                mediaHeader.addView(artView, LinearLayout.LayoutParams(px(40f), px(40f)))
+            }
+            val metaCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            metaCol.addView(label(liveMedia.title, 13.5f, tileColors.foreground).apply {
+                typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+                setSingleLine()
+                ellipsize = TextUtils.TruncateAt.END
+            })
+            metaCol.addView(label(liveMedia.artist, 11f, (tileColors.foreground and 0x00FFFFFF) or 0xBD000000.toInt()).apply {
+                typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+                setSingleLine()
+                ellipsize = TextUtils.TruncateAt.END
+            })
+            mediaHeader.addView(metaCol, LinearLayout.LayoutParams(0, -2, 1f).apply {
+                if (liveMedia.albumArt != null) marginStart = px(8f)
+            })
+            content.addView(mediaHeader, LinearLayout.LayoutParams(-1, px(48f)))
+            host.liveHeader = mediaHeader
+            val statusLine = label(if (liveMedia.isPlaying) "NOW PLAYING" else "PAUSED", 9.5f,
+                (tileColors.foreground and 0x00FFFFFF) or 0xA8000000.toInt()).apply {
+                letterSpacing = 0.14f
+                setPadding(0, px(4f), 0, px(4f))
+            }
+            content.addView(statusLine)
+            addTileActionRow(content, tileColors, listOf(
+                entry("⏮") { TileNotificationStore.skipPrevious() },
+                entry(if (liveMedia.isPlaying) "⏸" else "▶") { TileNotificationStore.togglePlayPause() },
+                entry("⏭") { TileNotificationStore.skipNext() }
+            ))
+            // Keep live media controls immediately visible on the tile face
+            front.visibility = View.GONE
+            content.visibility = View.VISIBLE
+            host.showingActions = true
+            return host
+        }
+
         val header = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         val glyph = appFace(app, false, slot, colorsOverride = tileColors).first.apply {
             setBackgroundColor(Color.TRANSPARENT)
@@ -1778,6 +1964,20 @@ class MainActivity : Activity() {
         header.addView(title, LinearLayout.LayoutParams(0, -1, 1f).apply { marginStart = px(6f) })
         content.addView(header, LinearLayout.LayoutParams(-1, px(45f)))
         host.liveHeader = header
+        val notifSnippet = if (dynamicOn && packageName != null) TileNotificationStore.summary(packageName)?.previewLine() else null
+        if (!notifSnippet.isNullOrBlank()) {
+            content.addView(label(notifSnippet, 11f, (tileColors.foreground and 0x00FFFFFF) or 0xD0000000.toInt()).apply {
+                typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+                maxLines = 2
+                ellipsize = TextUtils.TruncateAt.END
+                setPadding(px(2f), 0, px(2f), px(4f))
+            })
+        } else if (dynamicOn && slot?.id == "settings") {
+            content.addView(label("Battery ${liveContentHub.battery.shortLabel()}", 11.5f,
+                (tileColors.foreground and 0x00FFFFFF) or 0xCC000000.toInt()).apply {
+                setPadding(px(2f), 0, px(2f), px(4f))
+            })
+        }
         val shortcuts = if (app != null) shortcutsFor(app).filter { it.isEnabled } else emptyList()
         if (packageName == GEMINI_PACKAGE) {
             addTileActionRow(content, tileColors, listOf(entry("New chat") {
@@ -4113,9 +4313,13 @@ class MainActivity : Activity() {
 
     private fun applyData() {
         val now = Date()
+        val batt = if (::liveContentHub.isInitialized && ::launcherPrefs.isInitialized && launcherPrefs.dynamicTilesEnabled) {
+            " · ${liveContentHub.battery.shortLabel()}"
+        } else ""
         glanceT?.apply {
             l1 = SimpleDateFormat("EEE, MMM d", Locale.getDefault()).format(now).lowercase()
-            l2 = if (wxTemp != null) "$wxDesc · $wxTemp°" else SimpleDateFormat("EEEE", Locale.getDefault()).format(now)
+            val base = if (wxTemp != null) "$wxDesc · $wxTemp°" else SimpleDateFormat("EEEE", Locale.getDefault()).format(now)
+            l2 = "$base$batt"
             back = if (evTitle != null) listOf(Pair(evTitle!!, true), Pair(evSub ?: "", false)) else emptyList()
             invalidate()
         }
@@ -4142,7 +4346,7 @@ class MainActivity : Activity() {
     }
 
     private fun loadWeather() {
-        if (checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) return
+        if (!PermissionsHelper.isLocationGranted(this)) return
         Thread {
             try {
                 val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
@@ -4175,6 +4379,7 @@ class MainActivity : Activity() {
                 runOnUiThread {
                     if (isDestroyed) return@runOnUiThread
                     wxTemp = t; wxDesc = d; wxHL = "h $hi° · l $lo°"; wxBack = b
+                    if (::liveContentHub.isInitialized) liveContentHub.saveCachedWeather(t, d, wxHL!!)
                     applyData()
                 }
             } catch (e: Exception) { }
