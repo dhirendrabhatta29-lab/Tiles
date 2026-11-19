@@ -17,11 +17,17 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # The runner already ships the Android SDK; just accept licenses and make sure platform 35 exists.
+      # The runner ships the Android SDK but not sdkmanager on PATH: call it by full path.
       - name: Prepare Android SDK
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          ls "$SDK/platforms" || true
+          yes | "$SDKM" --sdk_root="$SDK" --licenses > /dev/null || true
+          if [ ! -d "$SDK/platforms/android-35" ]; then
+            "$SDKM" --sdk_root="$SDK" "platforms;android-35" "build-tools;35.0.0"
+          fi
+          echo "sdk.dir=$SDK" > local.properties
 
       - uses: actions/cache@v4
         with:
