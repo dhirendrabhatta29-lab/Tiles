@@ -431,7 +431,12 @@ class MainActivity : Activity() {
     private var swallow = false
 
     private val prefs by lazy { getSharedPreferences("matte", MODE_PRIVATE) }
+    private lateinit var launcherPrefs: LauncherPrefs
+    private lateinit var settingsOverlay: SettingsOverlay
     private var launcherTheme = LauncherTheme.MATTE
+    private var dynamicTheme: ThemeColors? = null
+    private var wallpaperStops: IntArray = intArrayOf()
+    private var unregisterWallpaperObserver: (() -> Unit)? = null
     private var solidTiles: TileColors? = null
     private var customBackground: Int? = null
     private var useWallpaper = true
@@ -447,32 +452,59 @@ class MainActivity : Activity() {
     private lateinit var selectionAdd: TextView
     private lateinit var selectionHome: TextView
     private lateinit var selectionFolder: TextView
-    private val colors get() = if (solidTiles == null) launcherTheme.colors else LauncherTheme.GRAY.colors
+    private val colors: ThemeColors
+        get() = when {
+            solidTiles != null -> LauncherTheme.GRAY.colors
+            ::launcherPrefs.isInitialized && launcherPrefs.materialYouEnabled -> dynamicTheme ?: launcherTheme.colors
+            else -> launcherTheme.colors
+        }
     private fun tileColors(tone: TileTone) = solidTiles ?: colors[tone]
     private fun homeBackground() = customBackground ?: colors.background
     private fun rootColor() = if (useWallpaper) Color.TRANSPARENT else homeBackground()
-    private fun folderOverlayColor() = if (useWallpaper) 0xB3000000.toInt() else homeBackground() or Color.BLACK
-    private fun drawerColor() = if (useWallpaper) (colors.background and 0xFFFFFF) or 0xEE000000.toInt() else colors.background
+    private fun blurIntensity() = if (::launcherPrefs.isInitialized) launcherPrefs.blurIntensity else 45
+    private fun folderOverlayColor() = BlurEffects.overlayScrim(homeBackground(), blurIntensity(), useWallpaper)
+    private fun drawerColor() = BlurEffects.overlayScrim(colors.background, blurIntensity(), useWallpaper)
     private fun homeInk() = if (useWallpaper) Color.WHITE else TileColors.solid(homeBackground() or Color.BLACK).foreground
     private var u = 1f
     private var tile = 0
     private var gap = 0
     private fun px(v: Float) = (v * u).toInt()
 
+    private fun refreshDynamicPalette() {
+        launcherTheme = LauncherTheme.fromPreference(launcherPrefs.colorTheme)
+        solidTiles = if (launcherPrefs.solidMode) TileColors.solid(launcherPrefs.solidColor) else null
+        dynamicTheme = if (launcherPrefs.materialYouEnabled) WallpaperThemeEngine.resolveDynamicTheme(this) else null
+        wallpaperStops = WallpaperThemeEngine.extractWallpaperStops(this, colors)
+    }
+
+    private fun recomputeGridMetrics() {
+        val cols = if (::launcherPrefs.isInitialized) launcherPrefs.gridColumns else HomeGrid.COLUMNS_PER_VIEWPORT
+        val spacingDp = if (::launcherPrefs.isInitialized) launcherPrefs.tileSpacingDp.toFloat() else 6f
+        gap = px(spacingDp).coerceAtLeast(2)
+        tile = ((resources.displayMetrics.widthPixels - px(24f) - gap * (cols - 1)) / cols).coerceAtLeast(1)
+    }
+
+    private fun updateOverlayBlur() {
+        val anyOverlay = (::settingsOverlay.isInitialized && settingsOverlay.showing) ||
+            folderOpen || drawerOpen || menuView != null
+        val intensity = blurIntensity()
+        BlurEffects.applyWindowBlur(window, intensity, anyOverlay)
+        if (::homeTiles.isInitialized) {
+            BlurEffects.applyContentBlur(homeTiles, intensity, anyOverlay)
+        }
+    }
+
     // ------------------------------------------------------------ lifecycle
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        launcherTheme = LauncherTheme.fromPreference(prefs.getString("color_theme", null))
-        if (prefs.contains("home_background")) customBackground = prefs.getInt("home_background", colors.background)
-        useWallpaper = prefs.getBoolean("use_wallpaper", !prefs.contains("home_background"))
+        launcherPrefs = LauncherPrefs(prefs)
+        if (prefs.contains("home_background")) customBackground = prefs.getInt("home_background", LauncherTheme.MATTE.colors.background)
+        useWallpaper = launcherPrefs.useWallpaper
         customTiles = prefs.getBoolean("custom_tiles", false)
-        if (prefs.getBoolean("solid_mode", false)) {
-            solidTiles = TileColors.solid(prefs.getInt("solid_color", DEFAULT_SOLID_COLOR))
-        }
+        refreshDynamicPalette()
         u = resources.displayMetrics.widthPixels / 390f
-        gap = px(6f)
-        tile = (resources.displayMetrics.widthPixels - px(24f) - gap * 3) / 4
+        recomputeGridMetrics()
         la = getSystemService(Context.LAUNCHER_APPS_SERVICE) as LauncherApps
         awm = AppWidgetManager.getInstance(this)
         widgetHost = AppWidgetHost(this, HOST_ID)
@@ -484,6 +516,14 @@ class MainActivity : Activity() {
         buildUi()
         root.viewTreeObserver.addOnPreDrawListener(homePreDrawListener)
         reload()
+        unregisterWallpaperObserver = WallpaperThemeEngine.observeWallpaperColors(this) {
+            runOnUiThread {
+                if (!isDestroyed && (launcherPrefs.materialYouEnabled || launcherPrefs.wallpaperGradientEnabled || useWallpaper)) {
+                    refreshDynamicPalette()
+                    applyColors()
+                }
+            }
+        }
         lockAnimation = LockTurnController(this,
             tiles = { turnViews().filterIsInstance<TileHost>() },
             enabled = { prefs.getBoolean("lock_depth", true) },
@@ -505,9 +545,8 @@ class MainActivity : Activity() {
             override fun onPackagesUnavailable(p: Array<out String>?, u: UserHandle?, r: Boolean) = post(p.orEmpty().toSet())
             private fun post(packages: Set<String>) = runOnUiThread { reload(packages) }
         })
-        if (!prefs.getBoolean("asked", false)) {
-            prefs.edit().putBoolean("asked", true).apply()
-            requestPermissions(arrayOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.READ_CALENDAR), 1)
+        if (!launcherPrefs.onboardingSeen) {
+            root.post { if (!isDestroyed) openSettings(onboarding = true) }
         }
     }
 
@@ -515,6 +554,7 @@ class MainActivity : Activity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         loadWeather()
         loadEvent()
+        if (::settingsOverlay.isInitialized) settingsOverlay.refreshPermissions()
     }
 
     private fun locked(): Boolean = try {
@@ -542,12 +582,15 @@ class MainActivity : Activity() {
         if (::lockAnimation.isInitialized) lockAnimation.onResumed()
         cancelLaunchMotion()
         resumed = true
+        refreshDynamicPalette()
         loadWeather()
         loadEvent()
         if (folderOpen) rebuildFolderPages()
+        if (::settingsOverlay.isInitialized && settingsOverlay.showing) settingsOverlay.refreshPermissions()
         applyData()
         refreshAlarmLabels()
         if (useWallpaper) applyHomeBackground()
+        updateOverlayBlur()
         root.invalidate()
         startLive()
     }
@@ -584,6 +627,8 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        unregisterWallpaperObserver?.invoke()
+        unregisterWallpaperObserver = null
         if (::lockAnimation.isInitialized) lockAnimation.dispose()
         val observer = root.viewTreeObserver
         if (observer.isAlive) observer.removeOnPreDrawListener(homePreDrawListener)
@@ -634,6 +679,7 @@ class MainActivity : Activity() {
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         if (launchAnimator != null) cancelLaunchMotion()
+        else if (::settingsOverlay.isInitialized && settingsOverlay.showing) settingsOverlay.close()
         else if (menuView != null) closeMenu()
         else if (drawerOpen) closeDrawer()
         else if (folderEdit != null) { folderEdit = null; rebuildFolderPages() }
@@ -645,6 +691,7 @@ class MainActivity : Activity() {
         super.onNewIntent(intent)
         cancelLaunchMotion()
         closeMenu()
+        if (::settingsOverlay.isInitialized && settingsOverlay.showing) settingsOverlay.close(immediate = true)
         val wasDrawer = drawerOpen || drawer.visibility == View.VISIBLE
         if (wasDrawer) closeDrawer(immediate = true)
         if (wasDrawer && started && intent?.hasCategory(Intent.CATEGORY_HOME) == true) needsEntrance = true
@@ -656,6 +703,9 @@ class MainActivity : Activity() {
 
     /** Home: swipe up = app search with keyboard, swipe down = system notification shade. In search: swipe down closes. */
     override fun dispatchTouchEvent(e: MotionEvent): Boolean {
+        if (::settingsOverlay.isInitialized && settingsOverlay.showing) {
+            return super.dispatchTouchEvent(e)
+        }
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 handler.removeCallbacks(armFolderDrag)
@@ -1014,6 +1064,56 @@ class MainActivity : Activity() {
             bottomMargin = px(8f)
         })
         root.addView(drawer, FrameLayout.LayoutParams(-1, -1))
+        settingsOverlay = SettingsOverlay(this, launcherPrefs, object : SettingsOverlay.Callbacks {
+            override fun themeColors(): ThemeColors = colors
+            override fun useWallpaper(): Boolean = useWallpaper
+            override fun solidActive(): Boolean = solidTiles != null
+            override fun customTilesActive(): Boolean = customTiles
+            override fun onAppearanceChanged(rebuildLayout: Boolean) {
+                refreshDynamicPalette()
+                applyHomeBackground()
+                updateOverlayBlur()
+                if (rebuildLayout) applyColors()
+            }
+            override fun onLayoutConfigChanged() {
+                recomputeGridMetrics()
+                rebuildHome()
+                if (folderOpen) rebuildFolderPages()
+            }
+            override fun onDockConfigChanged() {
+                recomputeGridMetrics()
+                rebuildHome()
+            }
+            override fun onOpenBackgroundMenu() = backgroundMenu()
+            override fun onOpenSolidColorMenu() = solidColorMenu()
+            override fun onToggleCustomTiles() = toggleCustomTiles()
+            override fun onExportLayout() = selectLayoutFile(export = true)
+            override fun onImportLayout() = selectLayoutFile(export = false)
+            override fun onResetLayout() {
+                for (it in items) if (it.type == "widget" && it.wid >= 0) widgetHost.deleteAppWidgetId(it.wid)
+                prefs.edit().remove("items").apply(); loadItems(); rebuildHome()
+            }
+            override fun onCustomizeDock() = openDockCustomizeMenu()
+            override fun onOpenMotionMenu() = motionMenu()
+            override fun onClose() = updateOverlayBlur()
+        })
+        root.addView(settingsOverlay, FrameLayout.LayoutParams(-1, -1))
+    }
+
+    private fun openSettings(onboarding: Boolean = false) {
+        closeMenu()
+        if (drawerOpen) closeDrawer(immediate = true)
+        settingsOverlay.open(onboarding)
+        updateOverlayBlur()
+    }
+
+    private fun openDockCustomizeMenu() {
+        val entries = DOCK_IDS.map { id ->
+            val s = slots[id]!!
+            val current = resolve(s)?.label ?: id
+            entry("$id: $current") { pickFor(s) }
+        }
+        menu("customize dock", entries)
     }
 
     private fun span(sz: String): Pair<Int, Int> = TileSize.fromKey(sz).let { it.width to it.height }
@@ -1087,21 +1187,32 @@ class MainActivity : Activity() {
     }
 
     private fun styleTile(view: View, background: Int) {
-        val rounded = prefs.getBoolean("rounded_corners", false)
-        if (rounded) {
-            view.background = GradientDrawable().apply {
-                setColor(background)
-                cornerRadius = u * 11f
+        val radiusDp = if (::launcherPrefs.isInitialized) launcherPrefs.tileCornerRadiusDp else 0
+        val radius = u * radiusDp
+        val gradientOn = ::launcherPrefs.isInitialized && launcherPrefs.wallpaperGradientEnabled &&
+            background != Color.TRANSPARENT && wallpaperStops.isNotEmpty()
+        when {
+            gradientOn -> {
+                val stroke = if (colors.isDark) 0x26FFFFFF else 0x1A000000
+                view.background = WallpaperThemeEngine.tileGradient(background, wallpaperStops, radius, stroke)
             }
-        } else {
-            view.setBackgroundColor(background)
+            radius > 0f -> {
+                view.background = GradientDrawable().apply {
+                    setColor(background)
+                    cornerRadius = radius
+                }
+            }
+            else -> view.setBackgroundColor(background)
         }
-        view.clipToOutline = rounded
+        view.clipToOutline = radius > 0f
     }
 
     private fun tileHost(face: View, bg: Int): TileHost {
         val h = TileHost(this)
         styleTile(h, bg)
+        if (face is TileView && bg != Color.TRANSPARENT) {
+            face.setBackgroundColor(Color.TRANSPARENT)
+        }
         h.badgeInk = TileColors.solid(bg).foreground
         h.addView(face, FrameLayout.LayoutParams(-1, -1))
         h.face = face
@@ -1373,7 +1484,10 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(px(10f), px(10f), px(10f), px(8f))
         }
-        val frontFace = appFace(app, true, slot, colorsOverride = tileColors).first.apply { compactIcon = true }
+        val frontFace = appFace(app, true, slot, colorsOverride = tileColors).first.apply {
+            compactIcon = true
+            setBackgroundColor(Color.TRANSPARENT)
+        }
         val front = FrameLayout(this).apply { addView(frontFace, FrameLayout.LayoutParams(-1, -1)) }
         val host = tileHost(front, tileColors.background)
         host.face = frontFace
@@ -1414,7 +1528,9 @@ class MainActivity : Activity() {
         }
 
         val header = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-        val glyph = appFace(app, false, slot, colorsOverride = tileColors).first
+        val glyph = appFace(app, false, slot, colorsOverride = tileColors).first.apply {
+            setBackgroundColor(Color.TRANSPARENT)
+        }
         header.addView(glyph, LinearLayout.LayoutParams(px(35f), px(38f)))
         val title = label(app?.label ?: slot?.label ?: "App", 15f, tileColors.foreground).apply {
             gravity = Gravity.CENTER_VERTICAL
@@ -1599,6 +1715,7 @@ class MainActivity : Activity() {
         rebuildFolderPages()
         folderEntrancePending = true
         needsEntrance = false
+        updateOverlayBlur()
         root.invalidate()
     }
 
@@ -1619,6 +1736,7 @@ class MainActivity : Activity() {
         home.visibility = View.VISIBLE
         homeTiles.visibility = View.VISIBLE
         needsEntrance = true
+        updateOverlayBlur()
         root.invalidate()
     }
 
@@ -1989,6 +2107,7 @@ class MainActivity : Activity() {
         query.clearFocus()
         drawer.requestFocus()
         updateSelectionBar()
+        updateOverlayBlur()
         drawer.animate().translationY(0f).setDuration(DRAWER_OPEN_MS).setInterpolator(DecelerateInterpolator(1.6f)).start()
     }
 
@@ -2006,6 +2125,7 @@ class MainActivity : Activity() {
         clearSelection()
         updateSelectionBar()
         hideKeyboard()
+        updateOverlayBlur()
         drawer.animate().cancel()
         if (immediate) {
             drawer.visibility = View.INVISIBLE
@@ -2041,7 +2161,13 @@ class MainActivity : Activity() {
         dimBg.setOnClickListener { closeMenu() }
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(colors.panel)
+            background = BlurEffects.glassBackground(
+                baseColor = colors.panel,
+                blurIntensity = blurIntensity(),
+                cornerRadiusPx = px(18f).toFloat(),
+                isDark = colors.isDark,
+                strongerScrim = true
+            )
             setPadding(px(18f), px(14f), px(18f), px(10f))
             isClickable = true
         }
@@ -2066,18 +2192,27 @@ class MainActivity : Activity() {
         panel.animate().translationY(0f).setDuration(220)
             .setInterpolator(DecelerateInterpolator(1.6f)).start()
         menuView = dimBg
+        updateOverlayBlur()
     }
 
     private fun closeMenu() {
         menuView?.let { root.removeView(it) }
         menuView = null
+        updateOverlayBlur()
     }
 
     private fun entry(name: String, f: () -> Unit): Pair<String, () -> Unit> = Pair(name, f)
 
     private fun homeMenu() {
-        val rounded = prefs.getBoolean("rounded_corners", false)
+        val rounded = launcherPrefs.tileCornerRadiusDp > 0
+        val colorSummary = when {
+            solidTiles != null -> "solid"
+            launcherPrefs.materialYouEnabled -> "Material You"
+            else -> launcherTheme.label
+        }
         menu("home", listOf(
+            entry("launcher settings") { openSettings(onboarding = false) },
+            entry("permissions & setup") { openSettings(onboarding = true) },
             entry("all apps") { openDrawer(null, null) },
             entry("add apps here") { addApps(currentColumn(), fixed = false) },
             entry("add apps to the right") {
@@ -2087,15 +2222,14 @@ class MainActivity : Activity() {
             entry("add widget") { addWidget() },
             entry("export layout") { selectLayoutFile(export = true) },
             entry("import layout") { selectLayoutFile(export = false) },
-            entry("colors: ${if (solidTiles != null) "solid" else launcherTheme.label}") { colorMenu() },
+            entry("colors: $colorSummary") { colorMenu() },
             entry(if (customTiles) "custom tile style: on (move/resize off)" else "custom tile style: off") { toggleCustomTiles() },
-            entry(if (rounded) "tile corners: rounded" else "tile corners: square") {
-                prefs.edit().putBoolean("rounded_corners", !rounded).apply()
+            entry(if (rounded) "tile corners: rounded (${launcherPrefs.tileCornerRadiusDp}dp)" else "tile corners: square") {
+                launcherPrefs.tileCornerRadiusDp = if (rounded) 0 else 16
                 rebuildHome()
                 rebuildDrawer()
             },
             entry("motion") { motionMenu() },
-            entry("notification badges") { openNotificationAccess() },
             entry("reset layout") {
                 for (it in items) if (it.type == "widget" && it.wid >= 0) widgetHost.deleteAppWidgetId(it.wid)
                 prefs.edit().remove("items").apply(); loadItems(); rebuildHome()
@@ -2373,11 +2507,20 @@ class MainActivity : Activity() {
 
     private fun applyHomeBackground() {
         val background = homeBackground()
-        root.setBackgroundColor(rootColor())
+        val useGradientBackdrop = ::launcherPrefs.isInitialized && launcherPrefs.wallpaperGradientEnabled &&
+            !useWallpaper && wallpaperStops.isNotEmpty()
+        if (useGradientBackdrop) {
+            root.background = WallpaperThemeEngine.backdropGradient(wallpaperStops, 0xFF)
+        } else {
+            root.setBackgroundColor(rootColor())
+        }
         if (useWallpaper) window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER)
         else window.clearFlags(WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER)
         if (::folderOverlay.isInitialized) folderOverlay.setBackgroundColor(folderOverlayColor())
         if (::drawer.isInitialized) drawer.setBackgroundColor(drawerColor())
+        if (::settingsOverlay.isInitialized && settingsOverlay.showing) {
+            settingsOverlay.setBackgroundColor(BlurEffects.overlayScrim(colors.background, blurIntensity(), useWallpaper))
+        }
         val darkIcons = if (useWallpaper) wallpaperPrefersDarkIcons()
             else TileColors.solid(background).foreground == Color.BLACK
         if (Build.VERSION.SDK_INT >= 30) {
@@ -2433,6 +2576,7 @@ class MainActivity : Activity() {
 
     private fun selectSolidColor(color: Int) {
         solidTiles = TileColors.solid(color)
+        launcherPrefs.materialYouEnabled = false
         prefs.edit().putBoolean("solid_mode", true).putInt("solid_color", color).apply()
         applyColors()
     }
@@ -2440,9 +2584,10 @@ class MainActivity : Activity() {
     private fun themeMenu() {
         val themes = LauncherTheme.entries
         val entries = themes.map { theme ->
-            entry(if (solidTiles == null && theme == launcherTheme) "${theme.label} ✓" else theme.label) {
+            entry(if (solidTiles == null && !launcherPrefs.materialYouEnabled && theme == launcherTheme) "${theme.label} ✓" else theme.label) {
                 launcherTheme = theme
                 solidTiles = null
+                launcherPrefs.materialYouEnabled = false
                 prefs.edit().putString("color_theme", theme.name).putBoolean("solid_mode", false).apply()
                 applyColors()
             }
@@ -2563,6 +2708,9 @@ class MainActivity : Activity() {
     /** Long press: the app's own shortcuts, app info, uninstall (as on Pixel), then resize / change / remove. */
     private fun appMenu(app: App?, it: Item?, s: Slot?, fromDrawer: Boolean) {
         val e = ArrayList<Pair<String, () -> Unit>>()
+        if (s?.id == "settings") {
+            e.add(entry("tiles launcher settings") { openSettings(onboarding = false) })
+        }
         if (app != null) {
             for (sc in shortcutsFor(app).take(4)) {
                 e.add(entry((sc.shortLabel ?: "shortcut").toString().lowercase()) {

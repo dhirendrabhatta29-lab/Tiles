@@ -1,3 +1,4 @@
 <resources>
-    <string name="app_name">Matte Live 1.4.0</string>
+    <string name="app_name">Tiles Launcher</string>
+    <string name="accessibility_service_description">Optional launcher gestures: double-tap empty home space to lock the screen, smoothly pull down the notification shade, or open Recents. No screen content is read or collected.</string>
 </resources>
